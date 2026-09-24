@@ -46,30 +46,50 @@ async def delete_later(message: discord.Message):
 
 class MessageModal(discord.ui.Modal, title="Créer un message"):
     content = discord.ui.TextInput(
-        label="Message normal (facultatif)", max_length=2000,
-        style=discord.TextStyle.paragraph, required=False,
-    )
-    title_field = discord.ui.TextInput(
-        label="Titre (facultatif)", max_length=256, required=False,
-    )
-    description = discord.ui.TextInput(
-        label="Description (facultative)", max_length=4096,
-        style=discord.TextStyle.paragraph, required=False,
-    )
-    color = discord.ui.TextInput(
-        label="Couleur hexadécimale", default="#5865F2",
-        max_length=7, required=False,
-    )
-    image = discord.ui.TextInput(
-        label="URL image (facultative)", max_length=500, required=False,
+        label="Message normal (facultatif)",
+        max_length=2000,
+        required=False,
+        style=discord.TextStyle.paragraph,
     )
 
-    def __init__(self, channel_id: Optional[int] = None):
+    title_field = discord.ui.TextInput(
+        label="Titre (facultatif)",
+        max_length=256,
+        required=False,
+    )
+
+    description = discord.ui.TextInput(
+        label="Description (facultative)",
+        max_length=4096,
+        required=False,
+        style=discord.TextStyle.paragraph,
+    )
+
+    color = discord.ui.TextInput(
+        label="Couleur hexadécimale",
+        default="#5865F2",
+        max_length=7,
+        required=False,
+    )
+
+    image = discord.ui.TextInput(
+        label="URL de l'image (facultative)",
+        max_length=500,
+        required=False,
+    )
+
+    channel_id = discord.ui.TextInput(
+        label="ID du salon cible (facultatif)",
+        placeholder="Laisse vide pour utiliser le salon courant",
+        max_length=20,
+        required=False,
+    )
+
+    def __init__(self, forced_channel_id: Optional[int] = None):
         super().__init__()
-        self.channel_id = channel_id
+        self.forced_channel_id = forced_channel_id
 
     async def on_submit(self, interaction: discord.Interaction):
-        # Réponse immédiate obligatoire sinon Discord dit "L'application n'a pas répondu à temps".
         await interaction.response.defer(ephemeral=True)
 
         content = str(self.content.value).strip()
@@ -77,34 +97,53 @@ class MessageModal(discord.ui.Modal, title="Créer un message"):
         description = str(self.description.value).strip()
         color = str(self.color.value).strip() or "#5865F2"
         image = str(self.image.value).strip()
+        raw_channel_id = str(self.channel_id.value).strip()
 
         if not any((content, title, description, image)):
             return await interaction.followup.send(
-                "Remplis au moins un champ.", ephemeral=True
+                "Remplis au moins un champ.",
+                ephemeral=True,
             )
+
         if image and not valid_url(image):
             return await interaction.followup.send(
-                "L'URL doit commencer par http:// ou https://.", ephemeral=True
+                "L'URL doit commencer par http:// ou https://.",
+                ephemeral=True,
             )
+
         try:
             embed_color = parse_color(color)
         except ValueError as error:
             return await interaction.followup.send(str(error), ephemeral=True)
 
-        channel = (
-            interaction.guild.get_channel(self.channel_id)
-            if self.channel_id
-            else interaction.channel
-        )
-        if not isinstance(channel, discord.TextChannel):
+        target_channel = None
+
+        if self.forced_channel_id:
+            target_channel = interaction.guild.get_channel(self.forced_channel_id)
+
+        if target_channel is None and raw_channel_id:
+            try:
+                target_channel = interaction.guild.get_channel(int(raw_channel_id))
+            except ValueError:
+                return await interaction.followup.send(
+                    "L'ID du salon est invalide.",
+                    ephemeral=True,
+                )
+
+        if target_channel is None:
+            target_channel = interaction.channel
+
+        if not isinstance(target_channel, discord.TextChannel):
             return await interaction.followup.send(
-                "Salon textuel introuvable.", ephemeral=True
+                "Le salon cible est invalide.",
+                ephemeral=True,
             )
 
         me = interaction.guild.me
-        if me is None or not channel.permissions_for(me).send_messages:
+        if me is None or not target_channel.permissions_for(me).send_messages:
             return await interaction.followup.send(
-                "Je ne peux pas parler dans ce salon.", ephemeral=True
+                "Je ne peux pas envoyer de message dans ce salon.",
+                ephemeral=True,
             )
 
         embed = None
@@ -118,9 +157,10 @@ class MessageModal(discord.ui.Modal, title="Créer un message"):
                 embed.set_image(url=image)
 
         try:
-            await channel.send(content=content or None, embed=embed)
+            await target_channel.send(content=content or None, embed=embed)
             await interaction.followup.send(
-                f"Message envoyé dans {channel.mention}.", ephemeral=True
+                f"Message envoyé dans {target_channel.mention}.",
+                ephemeral=True,
             )
         except (discord.Forbidden, discord.HTTPException):
             await interaction.followup.send(
@@ -134,18 +174,33 @@ class Panel(discord.ui.View):
         super().__init__(timeout=None)
 
     @discord.ui.button(
-        label="Créer un message", style=discord.ButtonStyle.primary,
-        emoji="✍️", custom_id="panel:create",
+        label="Créer un message",
+        style=discord.ButtonStyle.primary,
+        emoji="✍️",
+        custom_id="panel:create",
     )
-    async def create(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def create_message(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(MessageModal())
 
     @discord.ui.button(
-        label="Dans ce salon", style=discord.ButtonStyle.success,
-        emoji="📨", custom_id="panel:current",
+        label="Dans ce salon",
+        style=discord.ButtonStyle.success,
+        emoji="📨",
+        custom_id="panel:current",
     )
-    async def current(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(MessageModal(interaction.channel.id))
+    async def send_in_current_channel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(
+            MessageModal(forced_channel_id=interaction.channel.id)
+        )
+
+    @discord.ui.button(
+        label="Choisir un salon",
+        style=discord.ButtonStyle.secondary,
+        emoji="🧭",
+        custom_id="panel:choose",
+    )
+    async def choose_channel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(MessageModal())
 
 
 @bot.event
@@ -155,18 +210,19 @@ async def on_ready():
 
 @bot.event
 async def on_member_join(member: discord.Member):
-    if not JOIN_ENABLED or not member.guild.me:
+    if not JOIN_ENABLED:
         return
+
     for channel in member.guild.text_channels:
         permissions = channel.permissions_for(member.guild.me)
         if not permissions.view_channel or not permissions.send_messages:
             continue
         try:
-            message = await channel.send(
+            msg = await channel.send(
                 f"Bienvenue {member.mention} !",
                 allowed_mentions=discord.AllowedMentions(users=[member]),
             )
-            asyncio.create_task(delete_later(message))
+            asyncio.create_task(delete_later(msg))
             await asyncio.sleep(0.4)
         except (discord.Forbidden, discord.HTTPException):
             continue
@@ -178,10 +234,7 @@ async def on_member_join(member: discord.Member):
 async def panel_command(ctx: commands.Context):
     embed = discord.Embed(
         title="Panneau de création",
-        description=(
-            "Utilise un bouton. Tous les champs sont facultatifs, "
-            "mais il faut en remplir au moins un."
-        ),
+        description="Choisis le salon cible puis remplis le formulaire.",
         color=discord.Color.blurple(),
     )
     await ctx.send(embed=embed, view=Panel())
@@ -205,8 +258,9 @@ async def parler(ctx: commands.Context, *, message: str):
 @bot.command(name="aide")
 async def aide(ctx: commands.Context):
     await ctx.send(
-        f"`{PREFIX}panel` ou `{PREFIX}pannel` panneau | "
-        f"`{PREFIX}parler <texte>` message | `{PREFIX}aide` aide",
+        f"`{PREFIX}panel` / `{PREFIX}pannel` = panneau de création | "
+        f"`{PREFIX}parler <texte>` = envoyer un message | "
+        f"`{PREFIX}aide` = aide",
         delete_after=15,
     )
 
@@ -225,9 +279,7 @@ async def main():
     app.router.add_get("/health", health)
     runner = web.AppRunner(app)
     await runner.setup()
-    await web.TCPSite(
-        runner, "0.0.0.0", int(os.getenv("PORT", "10000"))
-    ).start()
+    await web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", "10000"))).start()
     await bot.start(TOKEN)
 
 
