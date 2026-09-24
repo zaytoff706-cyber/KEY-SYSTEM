@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: key-system-discord-bot
+    env: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: BOT_PREFIX
+        value: "!"
+      - key: JOIN_ENABLED
+        value: "true"
