@@ -1,7 +1,7 @@
 import asyncio
 import os
 import re
-from typing import Optional
+from dataclasses import dataclass
 
 import discord
 from aiohttp import web
@@ -12,7 +12,9 @@ load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 PREFIX = os.getenv("BOT_PREFIX", "!")
-JOIN_ENABLED = os.getenv("JOIN_ENABLED", "true").lower() == "true"
+DEFAULT_JOIN_ENABLED = os.getenv("JOIN_ENABLED", "true").lower() == "true"
+DEFAULT_JOIN_MESSAGE = os.getenv("JOIN_MESSAGE", "Bienvenue {member} !")
+DEFAULT_DELETE_DELAY = max(1, min(60, int(os.getenv("JOIN_DELETE_DELAY", "3"))))
 
 if not TOKEN:
     raise RuntimeError("La variable DISCORD_TOKEN est obligatoire.")
@@ -23,6 +25,22 @@ intents.members = True
 intents.message_content = True
 
 bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
+
+
+@dataclass
+class GuildSettings:
+    join_enabled: bool = DEFAULT_JOIN_ENABLED
+    join_message: str = DEFAULT_JOIN_MESSAGE
+    delete_delay: int = DEFAULT_DELETE_DELAY
+
+
+settings: dict[int, GuildSettings] = {}
+
+
+def get_settings(guild_id: int) -> GuildSettings:
+    if guild_id not in settings:
+        settings[guild_id] = GuildSettings()
+    return settings[guild_id]
 
 
 def parse_color(value: str) -> discord.Color:
@@ -36,8 +54,12 @@ def valid_url(value: str) -> bool:
     return value.startswith(("http://", "https://"))
 
 
-async def delete_later(message: discord.Message):
-    await asyncio.sleep(3)
+def format_join_message(template: str, member: discord.Member) -> str:
+    return template.replace("{member}", member.mention).replace("{username}", member.name)
+
+
+async def delete_later(message: discord.Message, delay: int):
+    await asyncio.sleep(delay)
     try:
         await message.delete()
     except (discord.NotFound, discord.Forbidden, discord.HTTPException):
@@ -45,30 +67,24 @@ async def delete_later(message: discord.Message):
 
 
 class MessageModal(discord.ui.Modal, title="Créer un message"):
-    # Discord autorise au maximum 5 champs dans un modal.
+    # Discord autorise au maximum cinq champs dans un modal.
     content = discord.ui.TextInput(
-        label="Message normal (facultatif)",
-        max_length=2000,
-        required=False,
-        style=discord.TextStyle.paragraph,
+        label="Message normal (facultatif)", max_length=2000,
+        required=False, style=discord.TextStyle.paragraph,
     )
     title_field = discord.ui.TextInput(
-        label="Titre (facultatif)", max_length=256, required=False
+        label="Titre (facultatif)", max_length=256, required=False,
     )
     description = discord.ui.TextInput(
-        label="Description (facultative)",
-        max_length=4096,
-        required=False,
-        style=discord.TextStyle.paragraph,
+        label="Description (facultative)", max_length=4096,
+        required=False, style=discord.TextStyle.paragraph,
     )
     color = discord.ui.TextInput(
-        label="Couleur hexadécimale",
-        default="#5865F2",
-        max_length=7,
-        required=False,
+        label="Couleur hexadécimale", default="#5865F2",
+        max_length=7, required=False,
     )
     image = discord.ui.TextInput(
-        label="URL de l'image (facultative)", max_length=500, required=False
+        label="URL de l'image (facultative)", max_length=500, required=False,
     )
 
     def __init__(self, target_channel: discord.TextChannel):
@@ -76,7 +92,7 @@ class MessageModal(discord.ui.Modal, title="Créer un message"):
         self.target_channel = target_channel
 
     async def on_submit(self, interaction: discord.Interaction):
-        # Répondre immédiatement : Discord expire une interaction après ~3 secondes.
+        # Accusé de réception immédiat : Discord expire après environ 3 secondes.
         await interaction.response.defer(ephemeral=True)
 
         content = str(self.content.value).strip()
@@ -86,10 +102,7 @@ class MessageModal(discord.ui.Modal, title="Créer un message"):
         image = str(self.image.value).strip()
 
         if not any((content, title, description, image)):
-            return await interaction.followup.send(
-                "Remplis au moins un champ.", ephemeral=True
-            )
-
+            return await interaction.followup.send("Remplis au moins un champ.", ephemeral=True)
         if image and not valid_url(image):
             return await interaction.followup.send(
                 "L'URL doit commencer par http:// ou https://.", ephemeral=True
@@ -101,7 +114,8 @@ class MessageModal(discord.ui.Modal, title="Créer un message"):
             return await interaction.followup.send(str(error), ephemeral=True)
 
         me = interaction.guild.me
-        if me is None or not self.target_channel.permissions_for(me).send_messages:
+        permissions = self.target_channel.permissions_for(me) if me else None
+        if not permissions or not permissions.send_messages:
             return await interaction.followup.send(
                 "Je ne peux pas envoyer de message dans ce salon.", ephemeral=True
             )
@@ -123,13 +137,53 @@ class MessageModal(discord.ui.Modal, title="Créer un message"):
             )
         except (discord.Forbidden, discord.HTTPException):
             await interaction.followup.send(
-                "Discord a refusé l'envoi. Vérifie mes permissions dans ce salon.",
-                ephemeral=True,
+                "Discord a refusé l'envoi. Vérifie les permissions du bot.", ephemeral=True
             )
-        except Exception:
-            await interaction.followup.send(
-                "Une erreur inattendue est survenue pendant l'envoi.", ephemeral=True
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        print(f"Erreur du formulaire : {error!r}")
+        message = "Une erreur est survenue dans le formulaire."
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+
+
+class WelcomeSettingsModal(discord.ui.Modal, title="Réglages bienvenue"):
+    message = discord.ui.TextInput(
+        label="Message ({member} = mention)",
+        default=DEFAULT_JOIN_MESSAGE,
+        max_length=2000,
+        required=False,
+        style=discord.TextStyle.paragraph,
+    )
+    delay = discord.ui.TextInput(
+        label="Délai de suppression en secondes",
+        default=str(DEFAULT_DELETE_DELAY),
+        max_length=2,
+        required=False,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        config = get_settings(interaction.guild.id)
+        message = str(self.message.value).strip() or DEFAULT_JOIN_MESSAGE
+
+        try:
+            delete_delay = int(str(self.delay.value).strip() or DEFAULT_DELETE_DELAY)
+            if not 1 <= delete_delay <= 60:
+                raise ValueError
+        except ValueError:
+            return await interaction.followup.send(
+                "Le délai doit être un nombre entre 1 et 60.", ephemeral=True
             )
+
+        config.join_message = message
+        config.delete_delay = delete_delay
+        await interaction.followup.send(
+            f"Réglages sauvegardés. Le message sera supprimé après {delete_delay} seconde(s).",
+            ephemeral=True,
+        )
 
 
 class Panel(discord.ui.View):
@@ -143,20 +197,36 @@ class Panel(discord.ui.View):
     async def create_here(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not isinstance(interaction.channel, discord.TextChannel):
             return await interaction.response.send_message(
-                "Ce bouton doit être utilisé dans un salon textuel.", ephemeral=True
+                "Utilise ce bouton dans un salon textuel.", ephemeral=True
             )
         await interaction.response.send_modal(MessageModal(interaction.channel))
 
     @discord.ui.button(
-        label="Dans ce salon", style=discord.ButtonStyle.success,
-        emoji="📨", custom_id="panel:current",
+        label="Réglages bienvenue", style=discord.ButtonStyle.secondary,
+        emoji="⚙️", custom_id="panel:welcome_settings",
     )
-    async def send_in_current_channel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not isinstance(interaction.channel, discord.TextChannel):
+    async def welcome_settings(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.manage_guild:
             return await interaction.response.send_message(
-                "Ce bouton doit être utilisé dans un salon textuel.", ephemeral=True
+                "Il faut la permission `Gérer le serveur`.", ephemeral=True
             )
-        await interaction.response.send_modal(MessageModal(interaction.channel))
+        await interaction.response.send_modal(WelcomeSettingsModal())
+
+    @discord.ui.button(
+        label="Activer/Désactiver bienvenue", style=discord.ButtonStyle.success,
+        emoji="👋", custom_id="panel:welcome_toggle",
+    )
+    async def welcome_toggle(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.manage_guild:
+            return await interaction.response.send_message(
+                "Il faut la permission `Gérer le serveur`.", ephemeral=True
+            )
+        config = get_settings(interaction.guild.id)
+        config.join_enabled = not config.join_enabled
+        status = "activés" if config.join_enabled else "désactivés"
+        await interaction.response.send_message(
+            f"Les messages de bienvenue sont maintenant **{status}**.", ephemeral=True
+        )
 
 
 @bot.event
@@ -166,7 +236,8 @@ async def on_ready():
 
 @bot.event
 async def on_member_join(member: discord.Member):
-    if not JOIN_ENABLED or not member.guild.me:
+    config = get_settings(member.guild.id)
+    if not config.join_enabled or not member.guild.me:
         return
 
     for channel in member.guild.text_channels:
@@ -175,10 +246,12 @@ async def on_member_join(member: discord.Member):
             continue
         try:
             message = await channel.send(
-                f"Bienvenue {member.mention} !",
-                allowed_mentions=discord.AllowedMentions(users=[member]),
+                format_join_message(config.join_message, member),
+                allowed_mentions=discord.AllowedMentions(
+                    users=[member], everyone=False, roles=False
+                ),
             )
-            asyncio.create_task(delete_later(message))
+            asyncio.create_task(delete_later(message, config.delete_delay))
             await asyncio.sleep(0.4)
         except (discord.Forbidden, discord.HTTPException):
             continue
@@ -188,15 +261,20 @@ async def on_member_join(member: discord.Member):
 @commands.guild_only()
 @commands.has_permissions(manage_messages=True)
 async def panel_command(ctx: commands.Context):
-    embed = discord.Embed(
-        title="Panneau de création",
-        description=(
-            "Les deux boutons ouvrent le formulaire et envoient le message "
-            "dans le salon où se trouve le panneau. Remplis au moins un champ."
+    await ctx.send(
+        embed=discord.Embed(
+            title="Panneau du bot",
+            description=(
+                "**Créer ici** : crée un embed dans ce salon.\n"
+                "**Réglages bienvenue** : modifie le message et le délai.\n"
+                "**Activer/Désactiver** : contrôle les messages à l'arrivée.\n\n"
+                "Le bot envoie dans tous les salons où il possède réellement "
+                "`Voir le salon` et `Envoyer des messages`."
+            ),
+            color=discord.Color.blurple(),
         ),
-        color=discord.Color.blurple(),
+        view=Panel(),
     )
-    await ctx.send(embed=embed, view=Panel())
 
 
 @panel_command.error
@@ -240,6 +318,7 @@ async def main():
     await web.TCPSite(
         runner, "0.0.0.0", int(os.getenv("PORT", "10000"))
     ).start()
+    bot.add_view(Panel())
     await bot.start(TOKEN)
 
 
