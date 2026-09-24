@@ -61,55 +61,101 @@ async def delete_later(message: discord.Message, delay: int):
         pass
 
 
-class MessageModal(discord.ui.Modal, title="Créer un message"):
-    content = discord.ui.TextInput(label="Message normal (facultatif)", max_length=2000, required=False, style=discord.TextStyle.paragraph)
-    title_field = discord.ui.TextInput(label="Titre (facultatif)", max_length=256, required=False)
-    description = discord.ui.TextInput(label="Description (facultative)", max_length=4096, required=False, style=discord.TextStyle.paragraph)
-    color = discord.ui.TextInput(label="Couleur hexadécimale", default="#5865F2", max_length=7, required=False)
-    image = discord.ui.TextInput(label="URL de l'image (facultative)", max_length=500, required=False)
+class MessageModal(discord.ui.Modal, title="Créer un embed"):
+    content = discord.ui.TextInput(
+        label="Message au-dessus (facultatif)", max_length=2000,
+        required=False, style=discord.TextStyle.paragraph,
+    )
+    title_field = discord.ui.TextInput(
+        label="Titre de l'embed (facultatif)", max_length=256, required=False,
+    )
+    description = discord.ui.TextInput(
+        label="Description de l'embed (facultative)", max_length=4096,
+        required=False, style=discord.TextStyle.paragraph,
+    )
+    color = discord.ui.TextInput(
+        label="Couleur hexadécimale", default="#5865F2", max_length=7, required=False,
+    )
+    image = discord.ui.TextInput(
+        label="URL directe de l'image (facultative)", max_length=500, required=False,
+    )
 
     def __init__(self, target_channel: discord.TextChannel):
         super().__init__()
         self.target_channel = target_channel
 
     async def on_submit(self, interaction: discord.Interaction):
-        # Réponse dans les premières secondes, sinon Discord affiche « Échec de l'interaction ».
         await interaction.response.defer(ephemeral=True)
+
         content = str(self.content.value).strip()
         title = str(self.title_field.value).strip()
         description = str(self.description.value).strip()
-        color = str(self.color.value).strip() or "#5865F2"
+        color_text = str(self.color.value).strip() or "#5865F2"
         image = str(self.image.value).strip()
 
         if not any((content, title, description, image)):
-            return await interaction.followup.send("Remplis au moins un champ.", ephemeral=True)
+            return await interaction.followup.send(
+                "Remplis au moins un champ.", ephemeral=True
+            )
+
         if image and not valid_url(image):
-            return await interaction.followup.send("L'URL doit commencer par http:// ou https://.", ephemeral=True)
+            return await interaction.followup.send(
+                "L'image doit être une URL publique qui commence par http:// ou https://.",
+                ephemeral=True,
+            )
+
         try:
-            embed_color = parse_color(color)
+            embed_color = parse_color(color_text)
         except ValueError as error:
             return await interaction.followup.send(str(error), ephemeral=True)
 
         me = interaction.guild.me
         permissions = self.target_channel.permissions_for(me) if me else None
         if not permissions or not permissions.send_messages:
-            return await interaction.followup.send("Je ne peux pas envoyer de message dans ce salon.", ephemeral=True)
+            return await interaction.followup.send(
+                "Je n'ai pas la permission `Envoyer des messages` dans ce salon.",
+                ephemeral=True,
+            )
+
+        has_embed = bool(title or description or image)
+        if has_embed and not permissions.embed_links:
+            return await interaction.followup.send(
+                "Je n'ai pas la permission `Intégrer des liens` dans ce salon. "
+                "Active cette permission pour afficher l'embed.",
+                ephemeral=True,
+            )
 
         embed = None
-        if title or description or image:
-            embed = discord.Embed(color=embed_color)
-            if title:
-                embed.title = title
-            if description:
-                embed.description = description
+        if has_embed:
+            embed = discord.Embed(
+                title=title or None,
+                description=description or None,
+                colour=embed_color,
+            )
             if image:
                 embed.set_image(url=image)
 
         try:
-            await self.target_channel.send(content=content or None, embed=embed)
-            await interaction.followup.send(f"Message envoyé dans {self.target_channel.mention}.", ephemeral=True)
-        except (discord.Forbidden, discord.HTTPException):
-            await interaction.followup.send("Discord a refusé l'envoi. Vérifie les permissions du bot.", ephemeral=True)
+            await self.target_channel.send(
+                content=content or None,
+                embed=embed,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            kind = "Embed envoyé" if has_embed else "Message envoyé"
+            await interaction.followup.send(
+                f"{kind} dans {self.target_channel.mention}.", ephemeral=True
+            )
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "Discord a refusé l'envoi. Vérifie `Envoyer des messages` et "
+                "`Intégrer des liens`.", ephemeral=True,
+            )
+        except discord.HTTPException as error:
+            print(f"Erreur Discord pendant l'envoi : {error!r}")
+            await interaction.followup.send(
+                "Discord a refusé l'embed. Vérifie que l'URL de l'image est publique "
+                "et que le contenu ne dépasse pas les limites Discord.", ephemeral=True,
+            )
 
     async def on_error(self, interaction: discord.Interaction, error: Exception):
         print(f"Erreur formulaire : {error!r}")
@@ -123,8 +169,13 @@ class MessageModal(discord.ui.Modal, title="Créer un message"):
 
 
 class WelcomeSettingsModal(discord.ui.Modal, title="Réglages bienvenue"):
-    message = discord.ui.TextInput(label="Message ({member} = mention)", default=DEFAULT_JOIN_MESSAGE, max_length=2000, required=False, style=discord.TextStyle.paragraph)
-    delay = discord.ui.TextInput(label="Délai en secondes (1-60)", default="3", max_length=2, required=False)
+    message = discord.ui.TextInput(
+        label="Message ({member} = mention)", default=DEFAULT_JOIN_MESSAGE,
+        max_length=2000, required=False, style=discord.TextStyle.paragraph,
+    )
+    delay = discord.ui.TextInput(
+        label="Délai en secondes (1-60)", default="3", max_length=2, required=False,
+    )
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
@@ -135,64 +186,90 @@ class WelcomeSettingsModal(discord.ui.Modal, title="Réglages bienvenue"):
             if not 1 <= delay <= 60:
                 raise ValueError
         except ValueError:
-            return await interaction.followup.send("Le délai doit être entre 1 et 60 secondes.", ephemeral=True)
+            return await interaction.followup.send(
+                "Le délai doit être entre 1 et 60 secondes.", ephemeral=True
+            )
         config.delete_delay = delay
         await interaction.followup.send("Réglages sauvegardés.", ephemeral=True)
 
 
 class Panel(discord.ui.View):
-    def __init__(self, prefix: str = "panel"):
-        super().__init__(timeout=None)
-        self.prefix = prefix
-
-    async def open_message_modal(self, interaction: discord.Interaction):
-        if not isinstance(interaction.channel, discord.TextChannel):
-            return await interaction.response.send_message("Utilise ce panneau dans un salon textuel.", ephemeral=True)
-        await interaction.response.send_modal(MessageModal(interaction.channel))
-
-    @discord.ui.button(label="Créer ici", style=discord.ButtonStyle.primary, emoji="✍️", custom_id="panel:create_here")
-    async def create_here(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.open_message_modal(interaction)
-
-    @discord.ui.button(label="Réglages bienvenue", style=discord.ButtonStyle.secondary, emoji="⚙️", custom_id="panel:welcome_settings")
-    async def welcome_settings(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not interaction.user.guild_permissions.manage_guild:
-            return await interaction.response.send_message("Permission `Gérer le serveur` nécessaire.", ephemeral=True)
-        await interaction.response.send_modal(WelcomeSettingsModal())
-
-    @discord.ui.button(label="Activer/Désactiver bienvenue", style=discord.ButtonStyle.success, emoji="👋", custom_id="panel:welcome_toggle")
-    async def welcome_toggle(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not interaction.user.guild_permissions.manage_guild:
-            return await interaction.response.send_message("Permission `Gérer le serveur` nécessaire.", ephemeral=True)
-        config = get_settings(interaction.guild.id)
-        config.join_enabled = not config.join_enabled
-        status = "activés" if config.join_enabled else "désactivés"
-        await interaction.response.send_message(f"Messages de bienvenue {status}.", ephemeral=True)
-
-
-class LegacyPanel(discord.ui.View):
-    """Garde les anciens panneaux fonctionnels après une mise à jour."""
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="Créer un message", style=discord.ButtonStyle.primary, emoji="✍️", custom_id="panel:create")
+    async def open_message_modal(self, interaction: discord.Interaction):
+        if not isinstance(interaction.channel, discord.TextChannel):
+            return await interaction.response.send_message(
+                "Utilise ce panneau dans un salon textuel.", ephemeral=True
+            )
+        await interaction.response.send_modal(MessageModal(interaction.channel))
+
+    @discord.ui.button(
+        label="Créer ici", style=discord.ButtonStyle.primary,
+        emoji="✍️", custom_id="panel:create_here",
+    )
+    async def create_here(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.open_message_modal(interaction)
+
+    @discord.ui.button(
+        label="Réglages bienvenue", style=discord.ButtonStyle.secondary,
+        emoji="⚙️", custom_id="panel:welcome_settings",
+    )
+    async def welcome_settings(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.manage_guild:
+            return await interaction.response.send_message(
+                "Permission `Gérer le serveur` nécessaire.", ephemeral=True
+            )
+        await interaction.response.send_modal(WelcomeSettingsModal())
+
+    @discord.ui.button(
+        label="Activer/Désactiver bienvenue", style=discord.ButtonStyle.success,
+        emoji="👋", custom_id="panel:welcome_toggle",
+    )
+    async def welcome_toggle(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.manage_guild:
+            return await interaction.response.send_message(
+                "Permission `Gérer le serveur` nécessaire.", ephemeral=True
+            )
+        config = get_settings(interaction.guild.id)
+        config.join_enabled = not config.join_enabled
+        status = "activés" if config.join_enabled else "désactivés"
+        await interaction.response.send_message(
+            f"Messages de bienvenue {status}.", ephemeral=True
+        )
+
+
+class LegacyPanel(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Créer un message", style=discord.ButtonStyle.primary,
+        emoji="✍️", custom_id="panel:create",
+    )
     async def create(self, interaction: discord.Interaction, button: discord.ui.Button):
         if isinstance(interaction.channel, discord.TextChannel):
             await interaction.response.send_modal(MessageModal(interaction.channel))
         else:
-            await interaction.response.send_message("Utilise ce panneau dans un salon textuel.", ephemeral=True)
+            await interaction.response.send_message(
+                "Utilise ce panneau dans un salon textuel.", ephemeral=True
+            )
 
-    @discord.ui.button(label="Dans ce salon", style=discord.ButtonStyle.success, emoji="📨", custom_id="panel:current")
+    @discord.ui.button(
+        label="Dans ce salon", style=discord.ButtonStyle.success,
+        emoji="📨", custom_id="panel:current",
+    )
     async def current(self, interaction: discord.Interaction, button: discord.ui.Button):
         if isinstance(interaction.channel, discord.TextChannel):
             await interaction.response.send_modal(MessageModal(interaction.channel))
         else:
-            await interaction.response.send_message("Utilise ce panneau dans un salon textuel.", ephemeral=True)
+            await interaction.response.send_message(
+                "Utilise ce panneau dans un salon textuel.", ephemeral=True
+            )
 
 
 class BotClient(commands.Bot):
     async def setup_hook(self):
-        # Obligatoire : enregistre les boutons avant toute interaction Discord.
         self.add_view(Panel())
         self.add_view(LegacyPanel())
 
@@ -217,7 +294,9 @@ async def on_member_join(member: discord.Member):
         try:
             message = await channel.send(
                 format_join_message(config.join_message, member),
-                allowed_mentions=discord.AllowedMentions(users=[member], everyone=False, roles=False),
+                allowed_mentions=discord.AllowedMentions(
+                    users=[member], everyone=False, roles=False
+                ),
             )
             asyncio.create_task(delete_later(message, config.delete_delay))
             await asyncio.sleep(0.4)
@@ -229,16 +308,29 @@ async def on_member_join(member: discord.Member):
 @commands.guild_only()
 @commands.has_permissions(manage_messages=True)
 async def panel_command(ctx: commands.Context):
-    await ctx.send(embed=discord.Embed(
-        title="Panneau du bot",
-        description="**Créer ici** : formulaire de message.\n**Réglages bienvenue** : texte et délai.\n**Activer/Désactiver** : messages à l'arrivée.\n\nLe bot utilise tous les salons où il a `Voir le salon` et `Envoyer des messages`.",
-        color=discord.Color.blurple(),
-    ), view=Panel())
+    await ctx.send(
+        embed=discord.Embed(
+            title="Panneau du bot",
+            description=(
+                "**Créer ici** : crée un message ou un embed dans ce salon.\n"
+                "**Réglages bienvenue** : modifie le texte et le délai.\n"
+                "**Activer/Désactiver** : contrôle les messages à l'arrivée.\n\n"
+                "Pour un embed, remplis le titre, la description, la couleur ou l'URL d'image."
+            ),
+            color=discord.Color.blurple(),
+        ),
+        view=Panel(),
+    )
 
 
 @panel_command.error
 async def panel_error(ctx: commands.Context, error: commands.CommandError):
-    await ctx.send("Permission `Gérer les messages` nécessaire." if isinstance(error, commands.MissingPermissions) else "Erreur avec le panneau.", delete_after=5)
+    await ctx.send(
+        "Permission `Gérer les messages` nécessaire."
+        if isinstance(error, commands.MissingPermissions)
+        else "Erreur avec le panneau.",
+        delete_after=5,
+    )
 
 
 @bot.command(name="parler")
@@ -250,11 +342,18 @@ async def parler(ctx: commands.Context, *, message: str):
 
 @bot.command(name="aide")
 async def aide(ctx: commands.Context):
-    await ctx.send(f"`{PREFIX}panel` / `{PREFIX}pannel` | `{PREFIX}parler <texte>` | `{PREFIX}aide`", delete_after=15)
+    await ctx.send(
+        f"`{PREFIX}panel` / `{PREFIX}pannel` | "
+        f"`{PREFIX}parler <texte>` | `{PREFIX}aide`", delete_after=15
+    )
 
 
 async def health(request: web.Request):
-    return web.json_response({"status": "ok", "bot_ready": not bot.is_closed(), "bot_user": str(bot.user) if bot.user else None})
+    return web.json_response({
+        "status": "ok",
+        "bot_ready": not bot.is_closed(),
+        "bot_user": str(bot.user) if bot.user else None,
+    })
 
 
 async def main():
@@ -263,7 +362,9 @@ async def main():
     app.router.add_get("/health", health)
     runner = web.AppRunner(app)
     await runner.setup()
-    await web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", "10000"))).start()
+    await web.TCPSite(
+        runner, "0.0.0.0", int(os.getenv("PORT", "10000"))
+    ).start()
     await bot.start(TOKEN)
 
 
