@@ -202,6 +202,22 @@ class Panel(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item):
+        # Sans ça, une exception dans un bouton laisse Discord sans réponse
+        # pendant 3s -> "L'application n'a pas répondu à temps".
+        print(f"Erreur dans le panneau ({item}) : {error!r}")
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(
+                    "Une erreur est survenue avec ce bouton.", ephemeral=True
+                )
+            else:
+                await interaction.response.send_message(
+                    "Une erreur est survenue avec ce bouton.", ephemeral=True
+                )
+        except discord.HTTPException:
+            pass
+
     async def open_message_modal(self, interaction: discord.Interaction):
         if not isinstance(interaction.channel, discord.TextChannel):
             return await interaction.response.send_message(
@@ -247,6 +263,20 @@ class Panel(discord.ui.View):
 class LegacyPanel(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item):
+        print(f"Erreur dans l'ancien panneau ({item}) : {error!r}")
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(
+                    "Une erreur est survenue avec ce bouton.", ephemeral=True
+                )
+            else:
+                await interaction.response.send_message(
+                    "Une erreur est survenue avec ce bouton.", ephemeral=True
+                )
+        except discord.HTTPException:
+            pass
 
     @discord.ui.button(
         label="Créer un message", style=discord.ButtonStyle.primary,
