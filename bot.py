@@ -18,6 +18,11 @@ DEFAULT_JOIN_MESSAGE = os.getenv("JOIN_MESSAGE", "Bienvenue {member} !")
 if not TOKEN:
     raise RuntimeError("La variable DISCORD_TOKEN est obligatoire.")
 
+# IMPORTANT : intents.message_content doit AUSSI être activé sur le portail
+# développeur Discord (https://discord.com/developers/applications -> ton app
+# -> onglet "Bot" -> "Privileged Gateway Intents" -> MESSAGE CONTENT INTENT).
+# Sans ça, toutes les commandes préfixées (!panel, !parler, !aide) sont
+# ignorées silencieusement, même si le code ci-dessous les active.
 intents = discord.Intents.default()
 intents.guilds = True
 intents.members = True
@@ -282,6 +287,46 @@ async def on_ready():
     print(f"Connecté : {bot.user}")
 
 
+# --- Gestionnaire d'erreur GLOBAL -------------------------------------
+# Sans ça, une commande qui échoue (mauvaise permission, argument
+# manquant, etc.) ne répond RIEN sur Discord : l'erreur part juste dans
+# les logs Docker, et on a l'impression que le bot "ne répond pas".
+@bot.event
+async def on_command_error(ctx: commands.Context, error: commands.CommandError):
+    error = getattr(error, "original", error)
+
+    if isinstance(error, commands.CommandNotFound):
+        return  # on ignore les commandes inconnues, pas besoin de spammer
+
+    if isinstance(error, commands.MissingPermissions):
+        return await ctx.send(
+            "Il te manque la permission `Gérer les messages` pour ça.",
+            delete_after=6,
+        )
+
+    if isinstance(error, commands.MissingRequiredArgument):
+        return await ctx.send(
+            f"Il manque un argument : `{error.param.name}`. "
+            f"Regarde `{PREFIX}aide`.", delete_after=8,
+        )
+
+    if isinstance(error, commands.NoPrivateMessage):
+        return await ctx.send("Cette commande ne marche pas en message privé.", delete_after=6)
+
+    if isinstance(error, discord.Forbidden):
+        return await ctx.send(
+            "Je n'ai pas la permission de faire ça dans ce salon.", delete_after=6
+        )
+
+    # Toute autre erreur : on log ET on prévient l'utilisateur au lieu de
+    # rester silencieux.
+    print(f"Erreur non gérée dans la commande {ctx.command} : {error!r}")
+    try:
+        await ctx.send("Une erreur est survenue pendant l'exécution de la commande.", delete_after=6)
+    except discord.HTTPException:
+        pass
+
+
 @bot.event
 async def on_member_join(member: discord.Member):
     config = get_settings(member.guild.id)
@@ -337,7 +382,46 @@ async def panel_error(ctx: commands.Context, error: commands.CommandError):
 @commands.guild_only()
 @commands.has_permissions(manage_messages=True)
 async def parler(ctx: commands.Context, *, message: str):
-    await ctx.send(message)
+    # On efface la commande de l'utilisateur si possible, pour un rendu propre.
+    try:
+        await ctx.message.delete()
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
+    me = ctx.guild.me
+    permissions = ctx.channel.permissions_for(me) if me else None
+    if not permissions or not permissions.send_messages:
+        return await ctx.send(
+            "Je n'ai pas la permission `Envoyer des messages` dans ce salon.",
+            delete_after=6,
+        )
+
+    try:
+        await ctx.send(message, allowed_mentions=discord.AllowedMentions.none())
+    except discord.Forbidden:
+        await ctx.send(
+            "Discord a refusé l'envoi (permissions insuffisantes).", delete_after=6
+        )
+    except discord.HTTPException as error:
+        print(f"Erreur Discord dans !parler : {error!r}")
+        await ctx.send(
+            "Discord a refusé le message (trop long ou invalide ?).", delete_after=6
+        )
+
+
+@parler.error
+async def parler_error(ctx: commands.Context, error: commands.CommandError):
+    if isinstance(error, commands.MissingRequiredArgument):
+        return await ctx.send(
+            f"Utilisation : `{PREFIX}parler <texte à envoyer>`", delete_after=8
+        )
+    if isinstance(error, commands.MissingPermissions):
+        return await ctx.send(
+            "Permission `Gérer les messages` nécessaire pour utiliser `!parler`.",
+            delete_after=6,
+        )
+    # Les autres cas remontent au gestionnaire global on_command_error.
+    raise error
 
 
 @bot.command(name="aide")
