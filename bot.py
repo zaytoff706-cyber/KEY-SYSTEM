@@ -75,7 +75,7 @@ class MessageModal(discord.ui.Modal, title="Créer un embed"):
         label="Titre de l'embed (facultatif)", max_length=256, required=False,
     )
     description = discord.ui.TextInput(
-        label="Description de l'embed (facultative)", max_length=4096,
+        label="Description de l'embed (facultative)", max_length=4000,
         required=False, style=discord.TextStyle.paragraph,
     )
     color = discord.ui.TextInput(
