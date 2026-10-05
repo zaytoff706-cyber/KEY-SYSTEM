@@ -26,6 +26,20 @@ VERIFY_KEYWORDS = [
     if k.strip()
 ]
 
+
+def parse_id_set(name: str) -> set[int]:
+    raw = os.getenv(name, "").replace(" ", "")
+    return {int(x) for x in raw.split(",") if x.isdigit()}
+
+
+# --- Repost des vidéos --------------------------------------------------
+# VIDEO_REPOST_USER_IDS    : IDs (séparés par des virgules) des personnes dont
+#                            les vidéos sont reposts. Si vide, ce sont tous les
+#                            membres ayant la permission "Gérer les messages".
+# Le repost marche dans TOUS les salons (aucun filtre par salon).
+VIDEO_REPOST_USER_IDS = parse_id_set("VIDEO_REPOST_USER_IDS")
+VIDEO_EXTENSIONS = (".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v", ".wmv", ".flv")
+
 if not TOKEN:
     raise RuntimeError("La variable DISCORD_TOKEN est obligatoire.")
 
@@ -80,6 +94,56 @@ async def delete_later(message: discord.Message, delay: int):
         await message.delete()
     except (discord.NotFound, discord.Forbidden, discord.HTTPException):
         pass
+
+
+def is_video(attachment: discord.Attachment) -> bool:
+    content_type = (attachment.content_type or "").lower()
+    return content_type.startswith("video/") or attachment.filename.lower().endswith(
+        VIDEO_EXTENSIONS
+    )
+
+
+def can_repost(member: discord.Member) -> bool:
+    if VIDEO_REPOST_USER_IDS:
+        return member.id in VIDEO_REPOST_USER_IDS
+    return member.guild_permissions.manage_messages
+
+
+async def download_files(attachments: list[discord.Attachment]) -> list[discord.File]:
+    return [await a.to_file(spoiler=a.is_spoiler()) for a in attachments]
+
+
+async def resend_attachments(
+    channel: discord.abc.Messageable,
+    attachments: list[discord.Attachment],
+    content: str | None,
+) -> None:
+    """Renvoie les pièces jointes sans embed.
+
+    Discord accepte 10 fichiers max par message : on découpe par groupes de 10.
+    Si un groupe est refusé (trop lourd en une fois), on renvoie ses fichiers
+    un par un. Lève discord.HTTPException si ça échoue vraiment.
+    """
+    pending_content = content
+    no_mentions = discord.AllowedMentions.none()
+
+    for start in range(0, len(attachments), 10):
+        group = attachments[start:start + 10]
+        try:
+            files = await download_files(group)
+            await channel.send(
+                content=pending_content, files=files,
+                allowed_mentions=no_mentions, suppress_embeds=True,
+            )
+            pending_content = None
+        except discord.HTTPException:
+            for attachment in group:
+                files = await download_files([attachment])
+                await channel.send(
+                    content=pending_content, files=files,
+                    allowed_mentions=no_mentions, suppress_embeds=True,
+                )
+                pending_content = None
 
 
 class MessageModal(discord.ui.Modal, title="Créer un embed"):
@@ -407,6 +471,58 @@ async def on_member_join(member: discord.Member):
             asyncio.create_task(delete_later(message, config.delete_delay))
         except (discord.Forbidden, discord.HTTPException):
             continue
+
+
+@bot.listen("on_message")
+async def repost_videos(message: discord.Message):
+    # bot.listen (et pas bot.event) pour ne PAS bloquer les commandes !panel etc.
+    if message.author.bot or message.guild is None:
+        return
+    if not any(is_video(a) for a in message.attachments):
+        return
+    if not can_repost(message.author):
+        return
+
+    me = message.guild.me
+    permissions = message.channel.permissions_for(me) if me else None
+    if not permissions or not (
+        permissions.send_messages and permissions.attach_files and permissions.manage_messages
+    ):
+        print(
+            f"[{message.guild.name}] Repost vidéo impossible dans #{message.channel}: "
+            "il me faut Envoyer des messages, Joindre des fichiers et Gérer les messages."
+        )
+        return
+
+    # Le bot renvoie le fichier : il est donc limité par la taille max du serveur.
+    # Si c'est trop lourd, on ne supprime PAS l'original pour ne rien perdre.
+    limit = message.guild.filesize_limit
+    if any(a.size > limit for a in message.attachments):
+        limit_mb = limit // (1024 * 1024)
+        await message.channel.send(
+            f"Vidéo trop lourde pour que je la renvoie (limite du serveur : {limit_mb} Mo). "
+            "Je laisse ton message original.",
+            delete_after=8,
+        )
+        return
+
+    try:
+        await resend_attachments(
+            message.channel, list(message.attachments), message.content or None
+        )
+    except discord.HTTPException as error:
+        print(f"Erreur pendant le repost des vidéos : {error!r}")
+        await message.channel.send(
+            "Je n'ai pas réussi à renvoyer la vidéo, je garde ton message original.",
+            delete_after=8,
+        )
+        return
+
+    # On supprime l'original seulement APRÈS que le renvoi a réussi.
+    try:
+        await message.delete()
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        pass
 
 
 @bot.command(name="panel", aliases=["pannel"])
