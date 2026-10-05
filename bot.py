@@ -600,11 +600,40 @@ async def parler_error(ctx: commands.Context, error: commands.CommandError):
     raise error
 
 
+async def set_join_ping(ctx: commands.Context, enabled: bool):
+    get_settings(ctx.guild.id).join_enabled = enabled
+
+    # On efface la commande pour garder le salon propre.
+    try:
+        await ctx.message.delete()
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
+    status = "activé ✅" if enabled else "désactivé ❌"
+    await ctx.send(f"Ping des nouveaux membres {status}.", delete_after=6)
+
+
+@bot.command(name="on")
+@commands.guild_only()
+@commands.has_permissions(manage_messages=True)
+async def ping_on(ctx: commands.Context):
+    await set_join_ping(ctx, True)
+
+
+@bot.command(name="off")
+@commands.guild_only()
+@commands.has_permissions(manage_messages=True)
+async def ping_off(ctx: commands.Context):
+    await set_join_ping(ctx, False)
+
+
 @bot.command(name="aide")
 async def aide(ctx: commands.Context):
     await ctx.send(
         f"`{PREFIX}panel` / `{PREFIX}pannel` | "
-        f"`{PREFIX}parler <texte>` | `{PREFIX}aide`", delete_after=15
+        f"`{PREFIX}parler <texte>` | "
+        f"`{PREFIX}on` / `{PREFIX}off` (ping des nouveaux membres) | "
+        f"`{PREFIX}aide`", delete_after=15
     )
 
 
