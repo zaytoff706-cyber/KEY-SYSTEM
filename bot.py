@@ -15,6 +15,17 @@ PREFIX = os.getenv("BOT_PREFIX", "!")
 DEFAULT_JOIN_ENABLED = os.getenv("JOIN_ENABLED", "true").lower() == "true"
 DEFAULT_JOIN_MESSAGE = os.getenv("JOIN_MESSAGE", "Bienvenue {member} !")
 
+# Mots-clés qui identifient le salon de vérification. Un salon est ciblé si
+# son nom (en minuscules) CONTIENT l'un de ces mots. Ça marche donc même si
+# le nom change un peu d'un serveur à l'autre ("✅-verifiy", "✅｜verifiy",
+# "✅-verify", etc.). Modifiable via la variable d'env VERIFY_CHANNEL_KEYWORDS
+# (séparés par des virgules).
+VERIFY_KEYWORDS = [
+    k.strip().lower()
+    for k in os.getenv("VERIFY_CHANNEL_KEYWORDS", "verifiy,verify").split(",")
+    if k.strip()
+]
+
 if not TOKEN:
     raise RuntimeError("La variable DISCORD_TOKEN est obligatoire.")
 
@@ -56,6 +67,11 @@ def valid_url(value: str) -> bool:
 
 def format_join_message(template: str, member: discord.Member) -> str:
     return template.replace("{member}", member.mention).replace("{username}", member.name)
+
+
+def is_verify_channel(channel: discord.abc.GuildChannel) -> bool:
+    name = channel.name.lower()
+    return any(keyword in name for keyword in VERIFY_KEYWORDS)
 
 
 async def delete_later(message: discord.Message, delay: int):
@@ -362,10 +378,25 @@ async def on_member_join(member: discord.Member):
     config = get_settings(member.guild.id)
     if not config.join_enabled or not member.guild.me:
         return
-    for channel in member.guild.text_channels:
-        permissions = channel.permissions_for(member.guild.me)
-        if not permissions.view_channel or not permissions.send_messages:
-            continue
+
+    # On ne ping QUE dans le(s) salon(s) de vérification (✅-verifiy),
+    # plus dans tous les salons du serveur.
+    targets = [
+        channel
+        for channel in member.guild.text_channels
+        if is_verify_channel(channel)
+        and channel.permissions_for(member.guild.me).view_channel
+        and channel.permissions_for(member.guild.me).send_messages
+    ]
+
+    if not targets:
+        print(
+            f"[{member.guild.name}] Aucun salon de vérification trouvé "
+            f"(mots-clés : {VERIFY_KEYWORDS}) ou permissions manquantes."
+        )
+        return
+
+    for channel in targets:
         try:
             message = await channel.send(
                 format_join_message(config.join_message, member),
@@ -374,7 +405,6 @@ async def on_member_join(member: discord.Member):
                 ),
             )
             asyncio.create_task(delete_later(message, config.delete_delay))
-            await asyncio.sleep(0.4)
         except (discord.Forbidden, discord.HTTPException):
             continue
 
