@@ -1,16 +1,3 @@
-"""
-cloner.py : extension pour ton bot (discord.py 2.x, Python 3.10+).
-
-Fonctions
-  * Clonage complet d'un serveur (nom, icône, rôles, catégories, salons, emojis)
-  * Clonage d'UNE catégorie (avec tous ses salons)
-  * Backups avec ID (code) importables sur n'importe quel serveur
-  * Stats arrivées / départs persistantes (survivent aux restarts)
-  * Panneau de config en embeds + boutons + menus
-
-Stockage sans base de données : un salon privé Discord (STORAGE_CHANNEL_ID).
-Sans ce salon : fichiers locaux dans ./data (effacés à chaque redéploiement Render).
-"""
 from __future__ import annotations
 
 import asyncio
@@ -28,9 +15,6 @@ from typing import Any, Optional
 import discord
 from discord.ext import commands, tasks
 
-# --------------------------------------------------------------------------
-# Config
-# --------------------------------------------------------------------------
 OWNER_IDS = {int(x) for x in os.getenv("OWNER_IDS", "").replace(" ", "").split(",") if x.isdigit()}
 STORAGE_CHANNEL_ID = int(os.getenv("STORAGE_CHANNEL_ID", "0") or 0)
 DATA_DIR = os.getenv("DATA_DIR", "data")
@@ -53,9 +37,6 @@ CH_ICON = {"text": "💬", "voice": "🔊", "stage": "🎙️", "forum": "🗂�
 RUNNING: set[int] = set()
 
 
-# --------------------------------------------------------------------------
-# Petits helpers
-# --------------------------------------------------------------------------
 def now() -> int:
     return int(time.time())
 
@@ -112,9 +93,6 @@ def missing_perms(guild: discord.Guild) -> list[str]:
     return [name for name, ok in need.items() if not ok]
 
 
-# --------------------------------------------------------------------------
-# Stockage persistant (salon Discord privé ou fichiers locaux)
-# --------------------------------------------------------------------------
 class Storage:
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -123,9 +101,9 @@ class Storage:
         self.state_msg: Optional[discord.Message] = None
         self.data: dict[str, Any] = {"guilds": {}, "backups": {}}
         self.dirty = False
+        self.failed = False
         self.lock = asyncio.Lock()
 
-    # ---- chargement
     async def load(self) -> None:
         if self.mode == "discord":
             try:
@@ -168,7 +146,6 @@ class Storage:
             pass
         return None
 
-    # ---- sauvegarde de l'état (stats)
     async def flush(self) -> None:
         if not self.dirty:
             return
@@ -196,11 +173,14 @@ class Storage:
             except discord.NotFound:
                 self.state_msg = None
                 self.dirty = True
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 self.dirty = True
-                print(f"[cloner] Sauvegarde échouée : {e!r}")
+                if not self.failed:
+                    print(f"[cloner] Sauvegarde échouée (nouvel essai automatique) : {e!r}")
+                self.failed = True
+            else:
+                self.failed = False
 
-    # ---- fichiers (backups)
     async def put_blob(self, name: str, blob: bytes) -> str:
         if self.mode == "discord":
             m = await self.channel.send(
@@ -236,9 +216,6 @@ class Storage:
         return 8 * 1024 * 1024
 
 
-# --------------------------------------------------------------------------
-# Snapshot d'un serveur
-# --------------------------------------------------------------------------
 def ser_ow(ch: discord.abc.GuildChannel) -> list[dict]:
     out = []
     for target, ow in ch.overwrites.items():
@@ -271,6 +248,7 @@ async def snapshot_guild(guild: discord.Guild, assets: bool = True) -> dict:
         "roles": [],
         "layout": [],
         "emojis": [],
+        "emoji_count": len(guild.emojis),
     }
     if assets and guild.icon:
         try:
@@ -318,12 +296,9 @@ async def snapshot_guild(guild: discord.Guild, assets: bool = True) -> dict:
 def snap_counts(snap: dict) -> tuple[int, int, int, int]:
     cats = sum(1 for l in snap["layout"] if l["cat"])
     chans = sum(len(l["channels"]) for l in snap["layout"])
-    return len(snap["roles"]), cats, chans, len(snap["emojis"])
+    return len(snap["roles"]), cats, chans, snap.get("emoji_count", len(snap["emojis"]))
 
 
-# --------------------------------------------------------------------------
-# Progression (embed mis à jour sans spam d'API)
-# --------------------------------------------------------------------------
 class Progress:
     LABELS = {
         "read": "Lecture du serveur source",
@@ -374,9 +349,6 @@ class Progress:
             pass
 
 
-# --------------------------------------------------------------------------
-# Moteur de clonage
-# --------------------------------------------------------------------------
 class Engine:
     def __init__(self, target: discord.Guild, snap: dict, opts: dict, only_cat: Optional[int],
                  progress: Progress, keep_ids: set[int]):
@@ -408,7 +380,6 @@ class Engine:
             await self.emojis()
         return self.res
 
-    # ---- étapes
     async def clean(self) -> None:
         t = self.t
         chans = [c for c in t.channels if c.id not in self.keep]
@@ -649,7 +620,7 @@ async def execute_clone(interaction: discord.Interaction, cog: "Cloner", parent:
         if STORAGE_CHANNEL_ID:
             keep.add(STORAGE_CHANNEL_ID)
         res = await Engine(target, snap, opts, only_cat, prog, keep).run()
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         print(f"[cloner] Erreur clonage : {exc!r}")
         final = err("Le clonage a été interrompu par une erreur inattendue. Relance-le : les éléments déjà créés sont ignorés.")
     else:
@@ -680,9 +651,6 @@ async def execute_clone(interaction: discord.Interaction, cog: "Cloner", parent:
             pass
 
 
-# --------------------------------------------------------------------------
-# Interface : panneau, config, backups
-# --------------------------------------------------------------------------
 class Toggle(discord.ui.Button):
     def __init__(self, key: str, label: str, emoji: str, danger: bool = False):
         super().__init__(label=label, emoji=emoji, style=discord.ButtonStyle.secondary, row=0)
@@ -771,7 +739,7 @@ class ConfigView(discord.ui.View):
         src = f"Backup `{self.backup_code}`" if self.backup_code else f"Serveur **{self.snap['name']}**"
         e = embed("🧬 Configuration du clonage", f"**Source :** {src}\n**Cible :** ce serveur", BLURPLE)
         e.add_field(name="📦 Contenu de la source",
-                    value=f"🎭 {roles} rôles\n📁 {cats} catégories\n💬 {chans} salons\n😀 {emojis if self.snap['emojis'] else '—'} emojis", inline=True)
+                    value=f"🎭 {roles} rôles\n📁 {cats} catégories\n💬 {chans} salons\n😀 {emojis} emojis", inline=True)
         if self.only_cat is not None:
             l = self.snap["layout"][self.only_cat]
             lines = "\n".join(f"{CH_ICON[c['type']]} {c['name']}" for c in l["channels"][:12]) or "(vide)"
@@ -847,7 +815,7 @@ class BackupSelect(discord.ui.Select):
         await interaction.response.defer()
         try:
             snap = unpack(await self.cog.store.get_blob(self.cog.store.data["backups"][code]["ref"]))
-        except Exception:  # noqa: BLE001
+        except Exception:
             return await interaction.edit_original_response(embed=err("Fichier du backup introuvable."), view=None)
         view = ConfigView(self.cog, self.user_id, snap, backup_code=code)
         await interaction.edit_original_response(embed=view.embed(), view=view)
@@ -930,9 +898,6 @@ class ClonePanel(discord.ui.View):
             pass
 
 
-# --------------------------------------------------------------------------
-# Cog principal : stats + backups + commandes
-# --------------------------------------------------------------------------
 class Cloner(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -941,7 +906,6 @@ class Cloner(commands.Cog):
         self.ready = asyncio.Event()
         self._boot_task: Optional[asyncio.Task] = None
 
-    # ---- cycle de vie
     async def cog_load(self) -> None:
         self.bot.add_view(ClonePanel())
         self._boot_task = asyncio.create_task(self._boot())
@@ -954,13 +918,21 @@ class Cloner(commands.Cog):
         await self.flush_all()
 
     async def _boot(self) -> None:
-        await self.bot.wait_until_ready()
-        await self.store.load()
-        for guild in self.bot.guilds:
-            await self.sync_guild(guild)
-        self.ready.set()
-        await self.flush_all()
-        self.flusher.start()
+        try:
+            await self.bot.wait_until_ready()
+            try:
+                await self.store.load()
+            except Exception as e:
+                print(f"[cloner] Chargement du stockage impossible : {e!r}")
+            for guild in self.bot.guilds:
+                try:
+                    await self.sync_guild(guild)
+                except Exception as e:
+                    print(f"[cloner] Synchro impossible pour {guild.name} : {e!r}")
+            await self.flush_all()
+            self.flusher.start()
+        finally:
+            self.ready.set()
 
     async def flush_all(self) -> None:
         for gid, ids in self.known.items():
@@ -973,7 +945,6 @@ class Cloner(commands.Cog):
     async def flusher(self) -> None:
         await self.flush_all()
 
-    # ---- stats : état par serveur
     def gs(self, guild: discord.Guild) -> dict:
         return self.store.data["guilds"].setdefault(
             str(guild.id),
@@ -989,17 +960,18 @@ class Cloner(commands.Cog):
         self.store.dirty = True
 
     async def sync_guild(self, guild: discord.Guild) -> None:
-        """Compare la liste actuelle à la dernière sauvegardée -> rattrape ce qui s'est passé hors-ligne."""
         try:
             if not guild.chunked:
                 await guild.chunk()
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             print(f"[cloner] Chunk impossible pour {guild.name}: {e!r}")
+            self.known.setdefault(guild.id, set(self.gs(guild)["known"]))
             return
         current = {m.id for m in guild.members}
         expected = guild.member_count or len(current)
         if abs(len(current) - expected) > max(5, expected * 0.02):
             print(f"[cloner] [{guild.name}] cache membres incomplet ({len(current)}/{expected}) : synchro ignorée.")
+            self.known.setdefault(guild.id, set(self.gs(guild)["known"]))
             return
 
         g = self.gs(guild)
@@ -1083,7 +1055,6 @@ class Cloner(commands.Cog):
         e.set_footer(text="Les départs d'avant l'installation ne sont pas récupérables : Discord ne les expose pas.")
         return e
 
-    # ---- backups
     def visible_backups(self, user_id: int) -> list[tuple[str, dict]]:
         out = []
         for code, m in self.store.data["backups"].items():
@@ -1096,8 +1067,9 @@ class Cloner(commands.Cog):
         await self.ready.wait()
         snap = await snapshot_guild(guild, assets=True)
         blob = pack(snap)
-        if len(blob) > self.store.file_limit:  # trop lourd : on retire les emojis
+        if len(blob) > self.store.file_limit:
             snap["emojis"] = []
+            snap["emoji_count"] = 0
             blob = pack(snap)
         if len(blob) > self.store.file_limit:
             raise RuntimeError("Le backup dépasse la taille maximale d'un fichier du salon de stockage.")
@@ -1126,7 +1098,6 @@ class Cloner(commands.Cog):
             e.add_field(name="⚠️ Stockage local", value="Sans `STORAGE_CHANNEL_ID`, ce backup disparaît au prochain redéploiement.", inline=False)
         return e
 
-    # ---- commandes
     @commands.command(name="clonepanel", aliases=["clonepannel"])
     @commands.guild_only()
     @commands.has_permissions(administrator=True)
