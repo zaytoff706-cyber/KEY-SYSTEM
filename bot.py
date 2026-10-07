@@ -1,6 +1,8 @@
 import asyncio
+import logging
 import os
 import re
+import signal
 from dataclasses import dataclass
 
 import discord
@@ -10,16 +12,13 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+logging.getLogger("discord.http").setLevel(logging.ERROR)
+
 TOKEN = os.getenv("DISCORD_TOKEN")
 PREFIX = os.getenv("BOT_PREFIX", "!")
 DEFAULT_JOIN_ENABLED = os.getenv("JOIN_ENABLED", "true").lower() == "true"
 DEFAULT_JOIN_MESSAGE = os.getenv("JOIN_MESSAGE", "Bienvenue {member} !")
 
-# Mots-clés qui identifient le salon de vérification. Un salon est ciblé si
-# son nom (en minuscules) CONTIENT l'un de ces mots. Ça marche donc même si
-# le nom change un peu d'un serveur à l'autre ("✅-verifiy", "✅｜verifiy",
-# "✅-verify", etc.). Modifiable via la variable d'env VERIFY_CHANNEL_KEYWORDS
-# (séparés par des virgules).
 VERIFY_KEYWORDS = [
     k.strip().lower()
     for k in os.getenv("VERIFY_CHANNEL_KEYWORDS", "verifiy,verify").split(",")
@@ -32,22 +31,20 @@ def parse_id_set(name: str) -> set[int]:
     return {int(x) for x in raw.split(",") if x.isdigit()}
 
 
-# --- Repost des vidéos --------------------------------------------------
-# VIDEO_REPOST_USER_IDS    : IDs (séparés par des virgules) des personnes dont
-#                            les vidéos sont reposts. Si vide, ce sont tous les
-#                            membres ayant la permission "Gérer les messages".
-# Le repost marche dans TOUS les salons (aucun filtre par salon).
 VIDEO_REPOST_USER_IDS = parse_id_set("VIDEO_REPOST_USER_IDS")
 VIDEO_EXTENSIONS = (".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v", ".wmv", ".flv")
+
+PERMISSION_NAMES = {
+    "administrator": "Administrateur",
+    "manage_messages": "Gérer les messages",
+    "manage_guild": "Gérer le serveur",
+    "manage_channels": "Gérer les salons",
+    "manage_roles": "Gérer les rôles",
+}
 
 if not TOKEN:
     raise RuntimeError("La variable DISCORD_TOKEN est obligatoire.")
 
-# IMPORTANT : intents.message_content doit AUSSI être activé sur le portail
-# développeur Discord (https://discord.com/developers/applications -> ton app
-# -> onglet "Bot" -> "Privileged Gateway Intents" -> MESSAGE CONTENT INTENT).
-# Sans ça, toutes les commandes préfixées (!panel, !parler, !aide) sont
-# ignorées silencieusement, même si le code ci-dessous les active.
 intents = discord.Intents.default()
 intents.guilds = True
 intents.members = True
@@ -118,12 +115,6 @@ async def resend_attachments(
     attachments: list[discord.Attachment],
     content: str | None,
 ) -> None:
-    """Renvoie les pièces jointes sans embed.
-
-    Discord accepte 10 fichiers max par message : on découpe par groupes de 10.
-    Si un groupe est refusé (trop lourd en une fois), on renvoie ses fichiers
-    un par un. Lève discord.HTTPException si ça échoue vraiment.
-    """
     pending_content = content
     no_mentions = discord.AllowedMentions.none()
 
@@ -283,8 +274,6 @@ class Panel(discord.ui.View):
         super().__init__(timeout=None)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception, item):
-        # Sans ça, une exception dans un bouton laisse Discord sans réponse
-        # pendant 3s -> "L'application n'a pas répondu à temps".
         print(f"Erreur dans le panneau ({item}) : {error!r}")
         try:
             if interaction.response.is_done():
@@ -387,6 +376,11 @@ class BotClient(commands.Bot):
     async def setup_hook(self):
         self.add_view(Panel())
         self.add_view(LegacyPanel())
+        try:
+            await self.load_extension("cloner")
+            print("Extension cloner chargée.")
+        except Exception as error:
+            print(f"Extension cloner NON chargée : {error!r}")
 
 
 bot = BotClient(command_prefix=PREFIX, intents=intents, help_command=None)
@@ -397,27 +391,28 @@ async def on_ready():
     print(f"Connecté : {bot.user}")
 
 
-# --- Gestionnaire d'erreur GLOBAL -------------------------------------
-# Sans ça, une commande qui échoue (mauvaise permission, argument
-# manquant, etc.) ne répond RIEN sur Discord : l'erreur part juste dans
-# les logs Docker, et on a l'impression que le bot "ne répond pas".
 @bot.event
 async def on_command_error(ctx: commands.Context, error: commands.CommandError):
     error = getattr(error, "original", error)
 
     if isinstance(error, commands.CommandNotFound):
-        return  # on ignore les commandes inconnues, pas besoin de spammer
+        return
 
     if isinstance(error, commands.MissingPermissions):
-        return await ctx.send(
-            "Il te manque la permission `Gérer les messages` pour ça.",
-            delete_after=6,
+        names = ", ".join(
+            f"`{PERMISSION_NAMES.get(p, p)}`" for p in error.missing_permissions
         )
+        return await ctx.send(f"Il te manque la permission {names} pour ça.", delete_after=6)
 
     if isinstance(error, commands.MissingRequiredArgument):
         return await ctx.send(
             f"Il manque un argument : `{error.param.name}`. "
             f"Regarde `{PREFIX}aide`.", delete_after=8,
+        )
+
+    if isinstance(error, commands.BadArgument):
+        return await ctx.send(
+            f"Argument invalide. Regarde `{PREFIX}aide`.", delete_after=8
         )
 
     if isinstance(error, commands.NoPrivateMessage):
@@ -428,8 +423,6 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
             "Je n'ai pas la permission de faire ça dans ce salon.", delete_after=6
         )
 
-    # Toute autre erreur : on log ET on prévient l'utilisateur au lieu de
-    # rester silencieux.
     print(f"Erreur non gérée dans la commande {ctx.command} : {error!r}")
     try:
         await ctx.send("Une erreur est survenue pendant l'exécution de la commande.", delete_after=6)
@@ -443,8 +436,6 @@ async def on_member_join(member: discord.Member):
     if not config.join_enabled or not member.guild.me:
         return
 
-    # On ne ping QUE dans le(s) salon(s) de vérification (✅-verifiy),
-    # plus dans tous les salons du serveur.
     targets = [
         channel
         for channel in member.guild.text_channels
@@ -475,7 +466,6 @@ async def on_member_join(member: discord.Member):
 
 @bot.listen("on_message")
 async def repost_videos(message: discord.Message):
-    # bot.listen (et pas bot.event) pour ne PAS bloquer les commandes !panel etc.
     if message.author.bot or message.guild is None:
         return
     if not any(is_video(a) for a in message.attachments):
@@ -494,8 +484,6 @@ async def repost_videos(message: discord.Message):
         )
         return
 
-    # Le bot renvoie le fichier : il est donc limité par la taille max du serveur.
-    # Si c'est trop lourd, on ne supprime PAS l'original pour ne rien perdre.
     limit = message.guild.filesize_limit
     if any(a.size > limit for a in message.attachments):
         limit_mb = limit // (1024 * 1024)
@@ -518,7 +506,6 @@ async def repost_videos(message: discord.Message):
         )
         return
 
-    # On supprime l'original seulement APRÈS que le renvoi a réussi.
     try:
         await message.delete()
     except (discord.NotFound, discord.Forbidden, discord.HTTPException):
@@ -544,21 +531,10 @@ async def panel_command(ctx: commands.Context):
     )
 
 
-@panel_command.error
-async def panel_error(ctx: commands.Context, error: commands.CommandError):
-    await ctx.send(
-        "Permission `Gérer les messages` nécessaire."
-        if isinstance(error, commands.MissingPermissions)
-        else "Erreur avec le panneau.",
-        delete_after=5,
-    )
-
-
 @bot.command(name="parler")
 @commands.guild_only()
 @commands.has_permissions(manage_messages=True)
 async def parler(ctx: commands.Context, *, message: str):
-    # On efface la commande de l'utilisateur si possible, pour un rendu propre.
     try:
         await ctx.message.delete()
     except (discord.Forbidden, discord.HTTPException):
@@ -585,25 +561,9 @@ async def parler(ctx: commands.Context, *, message: str):
         )
 
 
-@parler.error
-async def parler_error(ctx: commands.Context, error: commands.CommandError):
-    if isinstance(error, commands.MissingRequiredArgument):
-        return await ctx.send(
-            f"Utilisation : `{PREFIX}parler <texte à envoyer>`", delete_after=8
-        )
-    if isinstance(error, commands.MissingPermissions):
-        return await ctx.send(
-            "Permission `Gérer les messages` nécessaire pour utiliser `!parler`.",
-            delete_after=6,
-        )
-    # Les autres cas remontent au gestionnaire global on_command_error.
-    raise error
-
-
 async def set_join_ping(ctx: commands.Context, enabled: bool):
     get_settings(ctx.guild.id).join_enabled = enabled
 
-    # On efface la commande pour garder le salon propre.
     try:
         await ctx.message.delete()
     except (discord.Forbidden, discord.HTTPException):
@@ -627,14 +587,40 @@ async def ping_off(ctx: commands.Context):
     await set_join_ping(ctx, False)
 
 
-@bot.command(name="aide")
+@bot.command(name="aide", aliases=["help"])
 async def aide(ctx: commands.Context):
-    await ctx.send(
-        f"`{PREFIX}panel` / `{PREFIX}pannel` | "
-        f"`{PREFIX}parler <texte>` | "
-        f"`{PREFIX}on` / `{PREFIX}off` (ping des nouveaux membres) | "
-        f"`{PREFIX}aide`", delete_after=15
+    p = PREFIX
+    embed = discord.Embed(
+        title="📖 Liste des commandes",
+        description="Les réponses du bot se suppriment automatiquement après quelques secondes.",
+        color=discord.Color.blurple(),
     )
+    embed.add_field(
+        name="💬 Messages  •  Gérer les messages",
+        value=(
+            f"`{p}panel` : panneau pour créer un message ou un embed\n"
+            f"`{p}parler <texte>` : le bot envoie ton texte\n"
+            f"`{p}on` / `{p}off` : ping des nouveaux membres"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🧬 Clonage  •  Administrateur",
+        value=(
+            f"`{p}clonepanel` : panneau de contrôle complet\n"
+            f"`{p}clone <id_serveur>` : clone un serveur (ou une seule catégorie) ici\n"
+            f"`{p}backup` : sauvegarde ce serveur et donne un code\n"
+            f"`{p}loadbackup <code>` : importe un backup ici"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="📊 Statistiques  •  Gérer les messages",
+        value=f"`{p}stats` : membres, arrivées, départs, rétention",
+        inline=False,
+    )
+    embed.add_field(name="ℹ️ Divers", value=f"`{p}aide` : cette liste", inline=False)
+    await ctx.send(embed=embed, delete_after=60)
 
 
 async def health(request: web.Request):
@@ -654,7 +640,25 @@ async def main():
     await web.TCPSite(
         runner, "0.0.0.0", int(os.getenv("PORT", "10000"))
     ).start()
-    await bot.start(TOKEN)
+
+    loop = asyncio.get_running_loop()
+    pending = []
+
+    def request_shutdown():
+        pending.append(asyncio.create_task(bot.close()))
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, request_shutdown)
+        except (NotImplementedError, RuntimeError):
+            pass
+
+    try:
+        await bot.start(TOKEN)
+    finally:
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        await runner.cleanup()
 
 
 if __name__ == "__main__":
