@@ -2,7 +2,7 @@ import asyncio
 import json
 import os
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 
 import discord
 from aiohttp import web
@@ -42,9 +42,9 @@ class GuildSettings:
     join_message: str = DEFAULT_JOIN_MESSAGE
     delete_delay: int = 3
     autorole_id: int | None = DEFAULT_AUTOROLE_ID
-    # None = ghost ping dans tous les salons (comportement d'origine).
-    # Liste = uniquement dans ces salons (gérée avec !ping / !unping).
-    ping_channels: list[int] | None = None
+    # Salons où les nouveaux membres sont ping (gérés avec !ping / !unping).
+    # Liste vide = aucun ping. Il n'y a plus de "ping dans tous les salons".
+    ping_channels: list[int] = field(default_factory=list)
 
 
 settings: dict[int, GuildSettings] = {}
@@ -82,6 +82,7 @@ def load_settings() -> None:
     for guild_id, raw in data.items():
         try:
             fields = {key: value for key, value in raw.items() if key in known}
+            fields["ping_channels"] = fields.get("ping_channels") or []
             settings[int(guild_id)] = GuildSettings(**fields)
         except (TypeError, ValueError, AttributeError):
             continue
@@ -475,14 +476,12 @@ async def on_member_join(member: discord.Member):
     if not config.join_enabled or not member.guild.me:
         return
 
-    if config.ping_channels is None:
-        channels = member.guild.text_channels  # par défaut : tous les salons
-    else:
-        channels = [
-            channel
-            for channel in (member.guild.get_channel(cid) for cid in config.ping_channels)
-            if isinstance(channel, discord.TextChannel)
-        ]
+    # Uniquement les salons choisis avec !ping (jamais tous les salons).
+    channels = [
+        channel
+        for channel in (member.guild.get_channel(cid) for cid in config.ping_channels)
+        if isinstance(channel, discord.TextChannel)
+    ]
 
     for channel in channels:
         permissions = channel.permissions_for(member.guild.me)
@@ -702,14 +701,25 @@ async def parler_error(ctx: commands.Context, error: commands.CommandError):
     raise error
 
 
+async def reply_and_clean(ctx: commands.Context, text: str, delay: int = 5):
+    """Répond, puis supprime la commande de l'utilisateur et la réponse du bot."""
+    await ctx.send(
+        text, delete_after=delay, allowed_mentions=discord.AllowedMentions.none()
+    )
+    try:
+        await ctx.message.delete()
+    except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+        pass  # sans la permission "Gérer les messages", la commande reste visible
+
+
 @bot.command(name="off")
 @commands.guild_only()
 @commands.has_permissions(manage_guild=True)
 async def welcome_off(ctx: commands.Context):
     get_settings(ctx.guild.id).join_enabled = False
     save_settings()
-    await ctx.send(
-        "Messages de bienvenue **désactivés** sur ce serveur.", delete_after=8
+    await reply_and_clean(
+        ctx, "Pings désactivés : plus aucun salon ne ping les nouveaux membres."
     )
 
 
@@ -717,40 +727,42 @@ async def welcome_off(ctx: commands.Context):
 @commands.guild_only()
 @commands.has_permissions(manage_guild=True)
 async def welcome_on(ctx: commands.Context):
-    get_settings(ctx.guild.id).join_enabled = True
+    config = get_settings(ctx.guild.id)
+    config.join_enabled = True
     save_settings()
-    await ctx.send(
-        "Messages de bienvenue **activés** sur ce serveur.", delete_after=8
-    )
+    if config.ping_channels:
+        text = f"Pings activés dans {len(config.ping_channels)} salon(s)."
+    else:
+        text = f"Pings activés, mais aucun salon choisi : fais `{PREFIX}ping` dans les salons voulus."
+    await reply_and_clean(ctx, text)
 
 
 @bot.command(name="ping")
 @commands.guild_only()
 @commands.has_permissions(manage_guild=True)
 async def ping_here(ctx: commands.Context):
-    """Ajoute ce salon à la liste des salons où les nouveaux membres sont ghost ping."""
+    """Ajoute ce salon à ceux où les nouveaux membres sont ping."""
     if not isinstance(ctx.channel, discord.TextChannel):
-        return await ctx.send("Utilise cette commande dans un salon textuel.", delete_after=6)
+        return await reply_and_clean(ctx, "Utilise cette commande dans un salon textuel.")
 
     permissions = ctx.channel.permissions_for(ctx.guild.me)
     if not permissions.view_channel or not permissions.send_messages:
-        return await ctx.send(
+        return await reply_and_clean(
+            ctx,
             "Je ne peux pas écrire dans ce salon, donne-moi `Voir le salon` et "
-            "`Envoyer des messages`.", delete_after=8,
+            "`Envoyer des messages`.",
+            delay=8,
         )
 
     config = get_settings(ctx.guild.id)
-    if config.ping_channels is None:
-        config.ping_channels = []  # on passe en mode "salons choisis uniquement"
     if ctx.channel.id in config.ping_channels:
-        return await ctx.send("Ce salon est déjà dans la liste.", delete_after=6)
+        return await reply_and_clean(ctx, "Ce salon est déjà dans la liste.")
 
     config.ping_channels.append(ctx.channel.id)
     save_settings()
     note = "" if config.join_enabled else f" Attention : les pings sont désactivés, fais `{PREFIX}on`."
-    await ctx.send(
-        f"Les nouveaux membres seront ghost ping dans {ctx.channel.mention}.{note}",
-        delete_after=10,
+    await reply_and_clean(
+        ctx, f"Salon ajouté : les nouveaux membres seront ping ici.{note}"
     )
 
 
@@ -758,18 +770,14 @@ async def ping_here(ctx: commands.Context):
 @commands.guild_only()
 @commands.has_permissions(manage_guild=True)
 async def unping_here(ctx: commands.Context):
-    """Retire ce salon de la liste des salons où les nouveaux membres sont ghost ping."""
+    """Retire ce salon de ceux où les nouveaux membres sont ping."""
     config = get_settings(ctx.guild.id)
-    if config.ping_channels is None:
-        # Mode "tous les salons" : on passe en liste explicite sans ce salon.
-        config.ping_channels = [c.id for c in ctx.guild.text_channels if c.id != ctx.channel.id]
-    elif ctx.channel.id in config.ping_channels:
-        config.ping_channels.remove(ctx.channel.id)
-    else:
-        return await ctx.send("Ce salon n'est pas dans la liste.", delete_after=6)
+    if ctx.channel.id not in config.ping_channels:
+        return await reply_and_clean(ctx, "Ce salon n'est pas dans la liste.")
 
+    config.ping_channels.remove(ctx.channel.id)
     save_settings()
-    await ctx.send("Ce salon ne sera plus ping.", delete_after=8)
+    await reply_and_clean(ctx, "Salon retiré : il ne ping plus les nouveaux membres.")
 
 
 @bot.command(name="pings")
@@ -779,21 +787,14 @@ async def ping_list(ctx: commands.Context):
     """Affiche où le bot ping les nouveaux membres."""
     config = get_settings(ctx.guild.id)
     state = "activés" if config.join_enabled else "désactivés"
-    if config.ping_channels is None:
-        where = "tous les salons (aucun salon choisi avec `!ping`)"
-    else:
+    if config.ping_channels:
         mentions = [f"<#{cid}>" for cid in config.ping_channels]
-        if not mentions:
-            where = "aucun salon"
-        else:
-            where = " ".join(mentions[:40])
-            if len(mentions) > 40:
-                where += f" ... et {len(mentions) - 40} autres"
-    await ctx.send(
-        f"Pings {state}. Salons : {where}",
-        delete_after=20,
-        allowed_mentions=discord.AllowedMentions.none(),
-    )
+        where = " ".join(mentions[:40])
+        if len(mentions) > 40:
+            where += f" ... et {len(mentions) - 40} autres"
+    else:
+        where = "aucun (fais `" + PREFIX + "ping` dans un salon pour l'ajouter)"
+    await reply_and_clean(ctx, f"Pings {state}. Salons : {where}", delay=15)
 
 
 @bot.command(name="aide")
