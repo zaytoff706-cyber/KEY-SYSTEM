@@ -1,7 +1,8 @@
 import asyncio
+import json
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 
 import discord
 from aiohttp import web
@@ -41,6 +42,9 @@ class GuildSettings:
     join_message: str = DEFAULT_JOIN_MESSAGE
     delete_delay: int = 3
     autorole_id: int | None = DEFAULT_AUTOROLE_ID
+    # None = ghost ping dans tous les salons (comportement d'origine).
+    # Liste = uniquement dans ces salons (gérée avec !ping / !unping).
+    ping_channels: list[int] | None = None
 
 
 settings: dict[int, GuildSettings] = {}
@@ -48,6 +52,42 @@ settings: dict[int, GuildSettings] = {}
 
 def get_settings(guild_id: int) -> GuildSettings:
     return settings.setdefault(guild_id, GuildSettings())
+
+
+# Sauvegarde des réglages dans un fichier JSON pour que le bot "retienne" ses
+# réglages. ATTENTION : sur Render (plan gratuit) le disque est effacé à chaque
+# redéploiement/redémarrage ; il faut un disque persistant (ou une base de
+# données) pour que ça survive vraiment. DATA_FILE permet de changer l'emplacement.
+DATA_FILE = os.getenv("DATA_FILE", "data.json")
+
+
+def save_settings() -> None:
+    data = {str(guild_id): asdict(cfg) for guild_id, cfg in settings.items()}
+    tmp_path = DATA_FILE + ".tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as file:
+            json.dump(data, file)
+        os.replace(tmp_path, DATA_FILE)
+    except OSError as error:
+        print(f"Impossible de sauvegarder les réglages : {error!r}")
+
+
+def load_settings() -> None:
+    try:
+        with open(DATA_FILE, encoding="utf-8") as file:
+            data = json.load(file)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return
+    known = GuildSettings.__dataclass_fields__
+    for guild_id, raw in data.items():
+        try:
+            fields = {key: value for key, value in raw.items() if key in known}
+            settings[int(guild_id)] = GuildSettings(**fields)
+        except (TypeError, ValueError, AttributeError):
+            continue
+
+
+load_settings()
 
 
 def parse_color(value: str) -> discord.Color:
@@ -245,6 +285,7 @@ class WelcomeSettingsModal(discord.ui.Modal, title="Réglages bienvenue"):
                 "Le délai doit être entre 1 et 60 secondes.", ephemeral=True
             )
         config.delete_delay = delay
+        save_settings()
         await interaction.followup.send("Réglages sauvegardés.", ephemeral=True)
 
 
@@ -304,6 +345,7 @@ class Panel(discord.ui.View):
             )
         config = get_settings(interaction.guild.id)
         config.join_enabled = not config.join_enabled
+        save_settings()
         status = "activés" if config.join_enabled else "désactivés"
         await interaction.response.send_message(
             f"Messages de bienvenue {status}.", ephemeral=True
@@ -380,9 +422,14 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
         return  # on ignore les commandes inconnues, pas besoin de spammer
 
     if isinstance(error, commands.MissingPermissions):
+        names = {
+            "manage_messages": "Gérer les messages",
+            "manage_guild": "Gérer le serveur",
+            "manage_roles": "Gérer les rôles",
+        }
+        missing = ", ".join(f"`{names.get(p, p)}`" for p in error.missing_permissions)
         return await ctx.send(
-            "Il te manque la permission `Gérer les messages` pour ça.",
-            delete_after=6,
+            f"Il te manque la permission {missing} pour ça.", delete_after=6
         )
 
     if isinstance(error, commands.MissingRequiredArgument):
@@ -427,7 +474,17 @@ async def on_member_join(member: discord.Member):
 
     if not config.join_enabled or not member.guild.me:
         return
-    for channel in member.guild.text_channels:
+
+    if config.ping_channels is None:
+        channels = member.guild.text_channels  # par défaut : tous les salons
+    else:
+        channels = [
+            channel
+            for channel in (member.guild.get_channel(cid) for cid in config.ping_channels)
+            if isinstance(channel, discord.TextChannel)
+        ]
+
+    for channel in channels:
         permissions = channel.permissions_for(member.guild.me)
         if not permissions.view_channel or not permissions.send_messages:
             continue
@@ -544,6 +601,7 @@ async def autorole_definir(interaction: discord.Interaction, role: discord.Role)
     if problem:
         return await interaction.response.send_message(problem, ephemeral=True)
     get_settings(interaction.guild.id).autorole_id = role.id
+    save_settings()
     await interaction.response.send_message(
         f"Autorole activé : les nouveaux membres recevront {role.mention}.", ephemeral=True
     )
@@ -553,6 +611,7 @@ async def autorole_definir(interaction: discord.Interaction, role: discord.Role)
 @app_commands.checks.has_permissions(manage_roles=True)
 async def autorole_desactiver(interaction: discord.Interaction):
     get_settings(interaction.guild.id).autorole_id = None
+    save_settings()
     await interaction.response.send_message("Autorole désactivé.", ephemeral=True)
 
 
@@ -643,11 +702,105 @@ async def parler_error(ctx: commands.Context, error: commands.CommandError):
     raise error
 
 
+@bot.command(name="off")
+@commands.guild_only()
+@commands.has_permissions(manage_guild=True)
+async def welcome_off(ctx: commands.Context):
+    get_settings(ctx.guild.id).join_enabled = False
+    save_settings()
+    await ctx.send(
+        "Messages de bienvenue **désactivés** sur ce serveur.", delete_after=8
+    )
+
+
+@bot.command(name="on")
+@commands.guild_only()
+@commands.has_permissions(manage_guild=True)
+async def welcome_on(ctx: commands.Context):
+    get_settings(ctx.guild.id).join_enabled = True
+    save_settings()
+    await ctx.send(
+        "Messages de bienvenue **activés** sur ce serveur.", delete_after=8
+    )
+
+
+@bot.command(name="ping")
+@commands.guild_only()
+@commands.has_permissions(manage_guild=True)
+async def ping_here(ctx: commands.Context):
+    """Ajoute ce salon à la liste des salons où les nouveaux membres sont ghost ping."""
+    if not isinstance(ctx.channel, discord.TextChannel):
+        return await ctx.send("Utilise cette commande dans un salon textuel.", delete_after=6)
+
+    permissions = ctx.channel.permissions_for(ctx.guild.me)
+    if not permissions.view_channel or not permissions.send_messages:
+        return await ctx.send(
+            "Je ne peux pas écrire dans ce salon, donne-moi `Voir le salon` et "
+            "`Envoyer des messages`.", delete_after=8,
+        )
+
+    config = get_settings(ctx.guild.id)
+    if config.ping_channels is None:
+        config.ping_channels = []  # on passe en mode "salons choisis uniquement"
+    if ctx.channel.id in config.ping_channels:
+        return await ctx.send("Ce salon est déjà dans la liste.", delete_after=6)
+
+    config.ping_channels.append(ctx.channel.id)
+    save_settings()
+    note = "" if config.join_enabled else f" Attention : les pings sont désactivés, fais `{PREFIX}on`."
+    await ctx.send(
+        f"Les nouveaux membres seront ghost ping dans {ctx.channel.mention}.{note}",
+        delete_after=10,
+    )
+
+
+@bot.command(name="unping")
+@commands.guild_only()
+@commands.has_permissions(manage_guild=True)
+async def unping_here(ctx: commands.Context):
+    """Retire ce salon de la liste des salons où les nouveaux membres sont ghost ping."""
+    config = get_settings(ctx.guild.id)
+    if config.ping_channels is None:
+        # Mode "tous les salons" : on passe en liste explicite sans ce salon.
+        config.ping_channels = [c.id for c in ctx.guild.text_channels if c.id != ctx.channel.id]
+    elif ctx.channel.id in config.ping_channels:
+        config.ping_channels.remove(ctx.channel.id)
+    else:
+        return await ctx.send("Ce salon n'est pas dans la liste.", delete_after=6)
+
+    save_settings()
+    await ctx.send("Ce salon ne sera plus ping.", delete_after=8)
+
+
+@bot.command(name="pings")
+@commands.guild_only()
+@commands.has_permissions(manage_guild=True)
+async def ping_list(ctx: commands.Context):
+    """Affiche où le bot ping les nouveaux membres."""
+    config = get_settings(ctx.guild.id)
+    state = "activés" if config.join_enabled else "désactivés"
+    if config.ping_channels is None:
+        where = "tous les salons (aucun salon choisi avec `!ping`)"
+    else:
+        mentions = [f"<#{cid}>" for cid in config.ping_channels]
+        if not mentions:
+            where = "aucun salon"
+        else:
+            where = " ".join(mentions[:40])
+            if len(mentions) > 40:
+                where += f" ... et {len(mentions) - 40} autres"
+    await ctx.send(
+        f"Pings {state}. Salons : {where}",
+        delete_after=20,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
 @bot.command(name="aide")
 async def aide(ctx: commands.Context):
     await ctx.send(
         f"`{PREFIX}panel` / `{PREFIX}pannel` | "
-        f"`{PREFIX}parler <texte>` | `{PREFIX}aide` | "
+        f"`{PREFIX}parler <texte>` | `{PREFIX}on` / `{PREFIX}off` | `{PREFIX}ping` / `{PREFIX}unping` / `{PREFIX}pings` | `{PREFIX}aide` | "
         "`/massrole` | `/autorole definir|desactiver|statut`", delete_after=15
     )
 
