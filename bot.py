@@ -1,50 +1,34 @@
 import asyncio
-import logging
 import os
 import re
-import signal
 from dataclasses import dataclass
 
 import discord
 from aiohttp import web
+from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 
 load_dotenv()
 
-logging.getLogger("discord.http").setLevel(logging.ERROR)
-
 TOKEN = os.getenv("DISCORD_TOKEN")
 PREFIX = os.getenv("BOT_PREFIX", "!")
 DEFAULT_JOIN_ENABLED = os.getenv("JOIN_ENABLED", "true").lower() == "true"
 DEFAULT_JOIN_MESSAGE = os.getenv("JOIN_MESSAGE", "Bienvenue {member} !")
-
-VERIFY_KEYWORDS = [
-    k.strip().lower()
-    for k in os.getenv("VERIFY_CHANNEL_KEYWORDS", "verifiy,verify").split(",")
-    if k.strip()
-]
-
-
-def parse_id_set(name: str) -> set[int]:
-    raw = os.getenv(name, "").replace(" ", "")
-    return {int(x) for x in raw.split(",") if x.isdigit()}
-
-
-VIDEO_REPOST_USER_IDS = parse_id_set("VIDEO_REPOST_USER_IDS")
-VIDEO_EXTENSIONS = (".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v", ".wmv", ".flv")
-
-PERMISSION_NAMES = {
-    "administrator": "Administrateur",
-    "manage_messages": "Gérer les messages",
-    "manage_guild": "Gérer le serveur",
-    "manage_channels": "Gérer les salons",
-    "manage_roles": "Gérer les rôles",
-}
+# Optionnel : ID du rôle donné automatiquement à l'arrivée. Les réglages faits avec
+# /autorole sont en mémoire et disparaissent au redémarrage (Render free) ;
+# mettre AUTOROLE_ID dans les variables d'environnement les rend permanents.
+_autorole_env = os.getenv("AUTOROLE_ID", "").strip()
+DEFAULT_AUTOROLE_ID = int(_autorole_env) if _autorole_env.isdigit() else None
 
 if not TOKEN:
     raise RuntimeError("La variable DISCORD_TOKEN est obligatoire.")
 
+# IMPORTANT : intents.message_content doit AUSSI être activé sur le portail
+# développeur Discord (https://discord.com/developers/applications -> ton app
+# -> onglet "Bot" -> "Privileged Gateway Intents" -> MESSAGE CONTENT INTENT).
+# Sans ça, toutes les commandes préfixées (!panel, !parler, !aide) sont
+# ignorées silencieusement, même si le code ci-dessous les active.
 intents = discord.Intents.default()
 intents.guilds = True
 intents.members = True
@@ -56,6 +40,7 @@ class GuildSettings:
     join_enabled: bool = DEFAULT_JOIN_ENABLED
     join_message: str = DEFAULT_JOIN_MESSAGE
     delete_delay: int = 3
+    autorole_id: int | None = DEFAULT_AUTOROLE_ID
 
 
 settings: dict[int, GuildSettings] = {}
@@ -76,13 +61,31 @@ def valid_url(value: str) -> bool:
     return value.startswith(("http://", "https://"))
 
 
+DISCORD_CDN_HOSTS = ("cdn.discordapp.com", "media.discordapp.net")
+
+
+def normalize_image_url(value: str) -> str:
+    """Retire les paramètres de redimensionnement (?width=, ?height=, ?size=)
+    que Discord ajoute quand on copie le lien d'une image déjà envoyée dans
+    un salon. Sans ça, l'image reste coincée en petite taille (souvent
+    carrée) partout où le lien est réutilisé."""
+    if "?" not in value:
+        return value
+    base, _, query = value.partition("?")
+    if any(host in base for host in DISCORD_CDN_HOSTS):
+        # media.discordapp.net a besoin du paramètre "format" pour certains
+        # types de fichiers (ex: format=webp) ; on le garde s'il existe,
+        # mais on enlève width/height/size qui forcent une résolution réduite.
+        kept = [
+            part for part in query.split("&")
+            if not part.startswith(("width=", "height=", "size="))
+        ]
+        return base + ("?" + "&".join(kept) if kept else "")
+    return value
+
+
 def format_join_message(template: str, member: discord.Member) -> str:
     return template.replace("{member}", member.mention).replace("{username}", member.name)
-
-
-def is_verify_channel(channel: discord.abc.GuildChannel) -> bool:
-    name = channel.name.lower()
-    return any(keyword in name for keyword in VERIFY_KEYWORDS)
 
 
 async def delete_later(message: discord.Message, delay: int):
@@ -93,48 +96,22 @@ async def delete_later(message: discord.Message, delay: int):
         pass
 
 
-def is_video(attachment: discord.Attachment) -> bool:
-    content_type = (attachment.content_type or "").lower()
-    return content_type.startswith("video/") or attachment.filename.lower().endswith(
-        VIDEO_EXTENSIONS
-    )
-
-
-def can_repost(member: discord.Member) -> bool:
-    if VIDEO_REPOST_USER_IDS:
-        return member.id in VIDEO_REPOST_USER_IDS
-    return member.guild_permissions.manage_messages
-
-
-async def download_files(attachments: list[discord.Attachment]) -> list[discord.File]:
-    return [await a.to_file(spoiler=a.is_spoiler()) for a in attachments]
-
-
-async def resend_attachments(
-    channel: discord.abc.Messageable,
-    attachments: list[discord.Attachment],
-    content: str | None,
-) -> None:
-    pending_content = content
-    no_mentions = discord.AllowedMentions.none()
-
-    for start in range(0, len(attachments), 10):
-        group = attachments[start:start + 10]
-        try:
-            files = await download_files(group)
-            await channel.send(
-                content=pending_content, files=files,
-                allowed_mentions=no_mentions, suppress_embeds=True,
-            )
-            pending_content = None
-        except discord.HTTPException:
-            for attachment in group:
-                files = await download_files([attachment])
-                await channel.send(
-                    content=pending_content, files=files,
-                    allowed_mentions=no_mentions, suppress_embeds=True,
-                )
-                pending_content = None
+def role_problem(guild: discord.Guild, role: discord.Role, user: discord.Member | None = None) -> str | None:
+    """Retourne un message d'erreur si le bot (ou l'utilisateur) ne peut pas gérer ce rôle."""
+    me = guild.me
+    if role.is_default():
+        return "Le rôle @everyone ne peut pas être utilisé."
+    if role.managed:
+        return "Ce rôle est géré par une intégration/un bot, je ne peux pas le donner."
+    if role.permissions.administrator:
+        return "Par sécurité, je refuse de distribuer automatiquement un rôle Administrateur."
+    if me is None or not me.guild_permissions.manage_roles:
+        return "Il me manque la permission `Gérer les rôles`."
+    if role >= me.top_role:
+        return "Mon rôle doit être **au-dessus** de ce rôle dans la liste des rôles du serveur."
+    if user is not None and user.id != guild.owner_id and role >= user.top_role:
+        return "Tu ne peux pas gérer un rôle supérieur ou égal à ton plus haut rôle."
+    return None
 
 
 class MessageModal(discord.ui.Modal, title="Créer un embed"):
@@ -168,6 +145,8 @@ class MessageModal(discord.ui.Modal, title="Créer un embed"):
         description = str(self.description.value).strip()
         color_text = str(self.color.value).strip() or "#5865F2"
         image = str(self.image.value).strip()
+        if image:
+            image = normalize_image_url(image)
 
         if not any((content, title, description, image)):
             return await interaction.followup.send(
@@ -274,6 +253,8 @@ class Panel(discord.ui.View):
         super().__init__(timeout=None)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception, item):
+        # Sans ça, une exception dans un bouton laisse Discord sans réponse
+        # pendant 3s -> "L'application n'a pas répondu à temps".
         print(f"Erreur dans le panneau ({item}) : {error!r}")
         try:
             if interaction.response.is_done():
@@ -376,11 +357,7 @@ class BotClient(commands.Bot):
     async def setup_hook(self):
         self.add_view(Panel())
         self.add_view(LegacyPanel())
-        try:
-            await self.load_extension("cloner")
-            print("Extension cloner chargée.")
-        except Exception as error:
-            print(f"Extension cloner NON chargée : {error!r}")
+        await self.tree.sync()
 
 
 bot = BotClient(command_prefix=PREFIX, intents=intents, help_command=None)
@@ -391,28 +368,27 @@ async def on_ready():
     print(f"Connecté : {bot.user}")
 
 
+# --- Gestionnaire d'erreur GLOBAL -------------------------------------
+# Sans ça, une commande qui échoue (mauvaise permission, argument
+# manquant, etc.) ne répond RIEN sur Discord : l'erreur part juste dans
+# les logs Docker, et on a l'impression que le bot "ne répond pas".
 @bot.event
 async def on_command_error(ctx: commands.Context, error: commands.CommandError):
     error = getattr(error, "original", error)
 
     if isinstance(error, commands.CommandNotFound):
-        return
+        return  # on ignore les commandes inconnues, pas besoin de spammer
 
     if isinstance(error, commands.MissingPermissions):
-        names = ", ".join(
-            f"`{PERMISSION_NAMES.get(p, p)}`" for p in error.missing_permissions
+        return await ctx.send(
+            "Il te manque la permission `Gérer les messages` pour ça.",
+            delete_after=6,
         )
-        return await ctx.send(f"Il te manque la permission {names} pour ça.", delete_after=6)
 
     if isinstance(error, commands.MissingRequiredArgument):
         return await ctx.send(
             f"Il manque un argument : `{error.param.name}`. "
             f"Regarde `{PREFIX}aide`.", delete_after=8,
-        )
-
-    if isinstance(error, commands.BadArgument):
-        return await ctx.send(
-            f"Argument invalide. Regarde `{PREFIX}aide`.", delete_after=8
         )
 
     if isinstance(error, commands.NoPrivateMessage):
@@ -423,6 +399,8 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
             "Je n'ai pas la permission de faire ça dans ce salon.", delete_after=6
         )
 
+    # Toute autre erreur : on log ET on prévient l'utilisateur au lieu de
+    # rester silencieux.
     print(f"Erreur non gérée dans la commande {ctx.command} : {error!r}")
     try:
         await ctx.send("Une erreur est survenue pendant l'exécution de la commande.", delete_after=6)
@@ -433,25 +411,26 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
 @bot.event
 async def on_member_join(member: discord.Member):
     config = get_settings(member.guild.id)
+
+    # Autorole : donné avant tout le reste, indépendamment du message de bienvenue.
+    if config.autorole_id:
+        role = member.guild.get_role(config.autorole_id)
+        if role and role_problem(member.guild, role) is None:
+            try:
+                await member.add_roles(role, reason="Autorole")
+            except (discord.Forbidden, discord.HTTPException) as error:
+                print(f"Autorole impossible pour {member} : {error!r}")
+        elif role is None:
+            print(f"Autorole : rôle {config.autorole_id} introuvable dans {member.guild}.")
+        else:
+            print(f"Autorole : {role_problem(member.guild, role)}")
+
     if not config.join_enabled or not member.guild.me:
         return
-
-    targets = [
-        channel
-        for channel in member.guild.text_channels
-        if is_verify_channel(channel)
-        and channel.permissions_for(member.guild.me).view_channel
-        and channel.permissions_for(member.guild.me).send_messages
-    ]
-
-    if not targets:
-        print(
-            f"[{member.guild.name}] Aucun salon de vérification trouvé "
-            f"(mots-clés : {VERIFY_KEYWORDS}) ou permissions manquantes."
-        )
-        return
-
-    for channel in targets:
+    for channel in member.guild.text_channels:
+        permissions = channel.permissions_for(member.guild.me)
+        if not permissions.view_channel or not permissions.send_messages:
+            continue
         try:
             message = await channel.send(
                 format_join_message(config.join_message, member),
@@ -460,56 +439,133 @@ async def on_member_join(member: discord.Member):
                 ),
             )
             asyncio.create_task(delete_later(message, config.delete_delay))
+            await asyncio.sleep(0.4)
         except (discord.Forbidden, discord.HTTPException):
             continue
 
 
-@bot.listen("on_message")
-async def repost_videos(message: discord.Message):
-    if message.author.bot or message.guild is None:
-        return
-    if not any(is_video(a) for a in message.attachments):
-        return
-    if not can_repost(message.author):
-        return
+# --- Commandes slash : /massrole et /autorole --------------------------
+mass_locks: dict[int, asyncio.Lock] = {}
 
-    me = message.guild.me
-    permissions = message.channel.permissions_for(me) if me else None
-    if not permissions or not (
-        permissions.send_messages and permissions.attach_files and permissions.manage_messages
-    ):
-        print(
-            f"[{message.guild.name}] Repost vidéo impossible dans #{message.channel}: "
-            "il me faut Envoyer des messages, Joindre des fichiers et Gérer les messages."
-        )
-        return
 
-    limit = message.guild.filesize_limit
-    if any(a.size > limit for a in message.attachments):
-        limit_mb = limit // (1024 * 1024)
-        await message.channel.send(
-            f"Vidéo trop lourde pour que je la renvoie (limite du serveur : {limit_mb} Mo). "
-            "Je laisse ton message original.",
-            delete_after=8,
-        )
-        return
-
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        message = "Permission `Gérer les rôles` nécessaire."
+    elif isinstance(error, app_commands.NoPrivateMessage):
+        message = "Cette commande ne marche pas en message privé."
+    else:
+        print(f"Erreur commande slash : {error!r}")
+        message = "Une erreur est survenue pendant la commande."
     try:
-        await resend_attachments(
-            message.channel, list(message.attachments), message.content or None
-        )
-    except discord.HTTPException as error:
-        print(f"Erreur pendant le repost des vidéos : {error!r}")
-        await message.channel.send(
-            "Je n'ai pas réussi à renvoyer la vidéo, je garde ton message original.",
-            delete_after=8,
-        )
-        return
-
-    try:
-        await message.delete()
-    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+    except discord.HTTPException:
         pass
+
+
+@bot.tree.command(name="massrole", description="Donne un rôle à tous les membres du serveur")
+@app_commands.describe(
+    role="Le rôle à donner à tout le monde",
+    inclure_bots="Donner aussi le rôle aux bots (non par défaut)",
+)
+@app_commands.guild_only()
+@app_commands.checks.has_permissions(manage_roles=True)
+async def massrole(interaction: discord.Interaction, role: discord.Role, inclure_bots: bool = False):
+    guild = interaction.guild
+    problem = role_problem(guild, role, interaction.user)
+    if problem:
+        return await interaction.response.send_message(problem, ephemeral=True)
+
+    lock = mass_locks.setdefault(guild.id, asyncio.Lock())
+    if lock.locked():
+        return await interaction.response.send_message(
+            "Un massrole est déjà en cours sur ce serveur, attends qu'il se termine.",
+            ephemeral=True,
+        )
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    async with lock:
+        members = [m async for m in guild.fetch_members(limit=None)]
+        targets = [m for m in members if role not in m.roles and (inclure_bots or not m.bot)]
+
+        if not targets:
+            return await interaction.followup.send(
+                f"Tout le monde a déjà {role.mention}.", ephemeral=True
+            )
+
+        estimate = max(1, round(len(targets) * 0.5 / 60))
+        await interaction.followup.send(
+            f"Ajout de {role.mention} à **{len(targets)}** membre(s)... "
+            f"(environ {estimate} min). Je te préviens à la fin.",
+            ephemeral=True,
+        )
+
+        added = failed = 0
+        for member in targets:
+            try:
+                await member.add_roles(role, reason=f"/massrole par {interaction.user}")
+                added += 1
+            except (discord.Forbidden, discord.HTTPException):
+                failed += 1
+            await asyncio.sleep(0.5)  # évite de saturer l'API Discord
+
+    result = f"Terminé : {role.mention} ajouté à **{added}** membre(s)."
+    if failed:
+        result += f" **{failed}** échec(s) (membres au-dessus de moi, ou erreur Discord)."
+    try:
+        await interaction.followup.send(result, ephemeral=True)
+    except discord.HTTPException:
+        # Le jeton de l'interaction expire après 15 min : on prévient dans le salon.
+        try:
+            await interaction.channel.send(
+                f"{interaction.user.mention} {result}",
+                allowed_mentions=discord.AllowedMentions(users=[interaction.user]),
+            )
+        except discord.HTTPException:
+            pass
+
+
+autorole_group = app_commands.Group(
+    name="autorole",
+    description="Rôle donné automatiquement aux nouveaux membres",
+    guild_only=True,
+    default_permissions=discord.Permissions(manage_roles=True),
+)
+
+
+@autorole_group.command(name="definir", description="Choisit le rôle donné aux nouveaux membres")
+@app_commands.describe(role="Le rôle à donner automatiquement à l'arrivée")
+@app_commands.checks.has_permissions(manage_roles=True)
+async def autorole_definir(interaction: discord.Interaction, role: discord.Role):
+    problem = role_problem(interaction.guild, role, interaction.user)
+    if problem:
+        return await interaction.response.send_message(problem, ephemeral=True)
+    get_settings(interaction.guild.id).autorole_id = role.id
+    await interaction.response.send_message(
+        f"Autorole activé : les nouveaux membres recevront {role.mention}.", ephemeral=True
+    )
+
+
+@autorole_group.command(name="desactiver", description="Désactive l'autorole")
+@app_commands.checks.has_permissions(manage_roles=True)
+async def autorole_desactiver(interaction: discord.Interaction):
+    get_settings(interaction.guild.id).autorole_id = None
+    await interaction.response.send_message("Autorole désactivé.", ephemeral=True)
+
+
+@autorole_group.command(name="statut", description="Affiche l'autorole actuel")
+@app_commands.checks.has_permissions(manage_roles=True)
+async def autorole_statut(interaction: discord.Interaction):
+    role_id = get_settings(interaction.guild.id).autorole_id
+    role = interaction.guild.get_role(role_id) if role_id else None
+    text = f"Autorole actuel : {role.mention}." if role else "Aucun autorole défini."
+    await interaction.response.send_message(text, ephemeral=True)
+
+
+bot.tree.add_command(autorole_group)
 
 
 @bot.command(name="panel", aliases=["pannel"])
@@ -531,10 +587,21 @@ async def panel_command(ctx: commands.Context):
     )
 
 
+@panel_command.error
+async def panel_error(ctx: commands.Context, error: commands.CommandError):
+    await ctx.send(
+        "Permission `Gérer les messages` nécessaire."
+        if isinstance(error, commands.MissingPermissions)
+        else "Erreur avec le panneau.",
+        delete_after=5,
+    )
+
+
 @bot.command(name="parler")
 @commands.guild_only()
 @commands.has_permissions(manage_messages=True)
 async def parler(ctx: commands.Context, *, message: str):
+    # On efface la commande de l'utilisateur si possible, pour un rendu propre.
     try:
         await ctx.message.delete()
     except (discord.Forbidden, discord.HTTPException):
@@ -561,66 +628,28 @@ async def parler(ctx: commands.Context, *, message: str):
         )
 
 
-async def set_join_ping(ctx: commands.Context, enabled: bool):
-    get_settings(ctx.guild.id).join_enabled = enabled
-
-    try:
-        await ctx.message.delete()
-    except (discord.Forbidden, discord.HTTPException):
-        pass
-
-    status = "activé ✅" if enabled else "désactivé ❌"
-    await ctx.send(f"Ping des nouveaux membres {status}.", delete_after=6)
-
-
-@bot.command(name="on")
-@commands.guild_only()
-@commands.has_permissions(manage_messages=True)
-async def ping_on(ctx: commands.Context):
-    await set_join_ping(ctx, True)
+@parler.error
+async def parler_error(ctx: commands.Context, error: commands.CommandError):
+    if isinstance(error, commands.MissingRequiredArgument):
+        return await ctx.send(
+            f"Utilisation : `{PREFIX}parler <texte à envoyer>`", delete_after=8
+        )
+    if isinstance(error, commands.MissingPermissions):
+        return await ctx.send(
+            "Permission `Gérer les messages` nécessaire pour utiliser `!parler`.",
+            delete_after=6,
+        )
+    # Les autres cas remontent au gestionnaire global on_command_error.
+    raise error
 
 
-@bot.command(name="off")
-@commands.guild_only()
-@commands.has_permissions(manage_messages=True)
-async def ping_off(ctx: commands.Context):
-    await set_join_ping(ctx, False)
-
-
-@bot.command(name="aide", aliases=["help"])
+@bot.command(name="aide")
 async def aide(ctx: commands.Context):
-    p = PREFIX
-    embed = discord.Embed(
-        title="📖 Liste des commandes",
-        description="Les réponses du bot se suppriment automatiquement après quelques secondes.",
-        color=discord.Color.blurple(),
+    await ctx.send(
+        f"`{PREFIX}panel` / `{PREFIX}pannel` | "
+        f"`{PREFIX}parler <texte>` | `{PREFIX}aide` | "
+        "`/massrole` | `/autorole definir|desactiver|statut`", delete_after=15
     )
-    embed.add_field(
-        name="💬 Messages  •  Gérer les messages",
-        value=(
-            f"`{p}panel` : panneau pour créer un message ou un embed\n"
-            f"`{p}parler <texte>` : le bot envoie ton texte\n"
-            f"`{p}on` / `{p}off` : ping des nouveaux membres"
-        ),
-        inline=False,
-    )
-    embed.add_field(
-        name="🧬 Clonage  •  Administrateur",
-        value=(
-            f"`{p}clonepanel` : panneau de contrôle complet\n"
-            f"`{p}clone <id_serveur>` : clone un serveur (ou une seule catégorie) ici\n"
-            f"`{p}backup` : sauvegarde ce serveur et donne un code\n"
-            f"`{p}loadbackup <code>` : importe un backup ici"
-        ),
-        inline=False,
-    )
-    embed.add_field(
-        name="📊 Statistiques  •  Gérer les messages",
-        value=f"`{p}stats` : membres, arrivées, départs, rétention",
-        inline=False,
-    )
-    embed.add_field(name="ℹ️ Divers", value=f"`{p}aide` : cette liste", inline=False)
-    await ctx.send(embed=embed, delete_after=60)
 
 
 async def health(request: web.Request):
@@ -640,25 +669,7 @@ async def main():
     await web.TCPSite(
         runner, "0.0.0.0", int(os.getenv("PORT", "10000"))
     ).start()
-
-    loop = asyncio.get_running_loop()
-    pending = []
-
-    def request_shutdown():
-        pending.append(asyncio.create_task(bot.close()))
-
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        try:
-            loop.add_signal_handler(sig, request_shutdown)
-        except (NotImplementedError, RuntimeError):
-            pass
-
-    try:
-        await bot.start(TOKEN)
-    finally:
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
-        await runner.cleanup()
+    await bot.start(TOKEN)
 
 
 if __name__ == "__main__":
