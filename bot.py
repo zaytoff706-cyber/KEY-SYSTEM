@@ -45,6 +45,9 @@ class GuildSettings:
     # Salons où les nouveaux membres sont ping (gérés avec !ping / !unping).
     # Liste vide = aucun ping. Il n'y a plus de "ping dans tous les salons".
     ping_channels: list[int] = field(default_factory=list)
+    # Mode copie : le bot renvoie les messages de ces membres et supprime l'original.
+    copy_all_users: list[int] = field(default_factory=list)          # !coo : tous les salons
+    copy_channels: dict[str, list[int]] = field(default_factory=dict)  # !co : id membre -> salons
 
 
 settings: dict[int, GuildSettings] = {}
@@ -83,6 +86,8 @@ def load_settings() -> None:
         try:
             fields = {key: value for key, value in raw.items() if key in known}
             fields["ping_channels"] = fields.get("ping_channels") or []
+            fields["copy_all_users"] = fields.get("copy_all_users") or []
+            fields["copy_channels"] = fields.get("copy_channels") or {}
             settings[int(guild_id)] = GuildSettings(**fields)
         except (TypeError, ValueError, AttributeError):
             continue
@@ -409,6 +414,110 @@ bot = BotClient(command_prefix=PREFIX, intents=intents, help_command=None)
 @bot.event
 async def on_ready():
     print(f"Connecté : {bot.user}")
+
+
+# --- Mode copie (!co / !coo) ------------------------------------------
+copy_locks: dict[int, asyncio.Lock] = {}
+# Mentions autorisées dans les messages copiés : membres oui, @everyone / rôles non
+# (sinon le bot permettrait de contourner les permissions de la personne).
+COPY_MENTIONS = discord.AllowedMentions(
+    users=True, roles=False, everyone=False, replied_user=False
+)
+
+
+def should_copy(message: discord.Message) -> bool:
+    if message.guild is None or message.author.bot:
+        return False
+    config = settings.get(message.guild.id)
+    if config is None:
+        return False
+    author_id = message.author.id
+    if author_id in config.copy_all_users:
+        return True
+    return message.channel.id in config.copy_channels.get(str(author_id), [])
+
+
+async def copy_message(message: discord.Message) -> None:
+    """Renvoie le message (texte + fichiers) par le bot, puis supprime l'original.
+    L'original n'est supprimé que si le renvoi a réussi."""
+    guild = message.guild
+    author = message.author
+
+    # Le mode copie s'arrête de fonctionner si la personne perd la permission.
+    if not author.guild_permissions.manage_messages:
+        return
+    if message.type not in (discord.MessageType.default, discord.MessageType.reply):
+        return
+    # Stickers / sondages ne peuvent pas être renvoyés par un bot : on laisse tel quel.
+    if message.stickers or getattr(message, "poll", None):
+        return
+    if not message.content and not message.attachments:
+        return
+
+    limit = guild.filesize_limit
+    if any(attachment.size > limit for attachment in message.attachments):
+        try:
+            await message.channel.send(
+                f"{author.mention} un fichier dépasse la limite d'envoi du serveur, "
+                "je ne peux pas le renvoyer : ton message est laissé tel quel.",
+                delete_after=8,
+                allowed_mentions=discord.AllowedMentions(users=[author]),
+            )
+        except discord.HTTPException:
+            pass
+        return
+
+    # Un verrou par salon : les copies partent dans l'ordre où tu as envoyé.
+    async with copy_locks.setdefault(message.channel.id, asyncio.Lock()):
+        try:
+            files = [
+                await attachment.to_file(spoiler=attachment.is_spoiler())
+                for attachment in message.attachments
+            ]
+        except (discord.HTTPException, discord.NotFound) as error:
+            print(f"Copie : téléchargement impossible : {error!r}")
+            return
+
+        reference = None
+        if message.type == discord.MessageType.reply and message.reference \
+                and message.reference.message_id:
+            reference = discord.MessageReference(
+                message_id=message.reference.message_id,
+                channel_id=message.channel.id,
+                guild_id=guild.id,
+                fail_if_not_exists=False,
+            )
+
+        try:
+            await message.channel.send(
+                content=message.content or None,
+                files=files or None,
+                reference=reference,
+                allowed_mentions=COPY_MENTIONS,
+            )
+        except (discord.Forbidden, discord.HTTPException) as error:
+            print(f"Copie : envoi impossible (message original conservé) : {error!r}")
+            return
+
+        try:
+            await message.delete()
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException) as error:
+            print(f"Copie : suppression de l'original impossible : {error!r}")
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+
+    # Les commandes passent d'abord : sinon "!unco" serait copié au lieu d'être exécuté.
+    ctx = await bot.get_context(message)
+    if ctx.valid:
+        await bot.invoke(ctx)
+        return
+
+    if should_copy(message):
+        await copy_message(message)
 
 
 # --- Gestionnaire d'erreur GLOBAL -------------------------------------
@@ -797,11 +906,99 @@ async def ping_list(ctx: commands.Context):
     await reply_and_clean(ctx, f"Pings {state}. Salons : {where}", delay=15)
 
 
+@bot.command(name="co")
+@commands.guild_only()
+@commands.has_permissions(manage_messages=True)
+async def copy_here(ctx: commands.Context):
+    """Active la copie dans ce salon : le bot renvoie tes messages et supprime les originaux."""
+    perms = ctx.channel.permissions_for(ctx.guild.me)
+    needed = (
+        ("send_messages", "Envoyer des messages"),
+        ("attach_files", "Joindre des fichiers"),
+        ("manage_messages", "Gérer les messages"),
+    )
+    missing = [label for attr, label in needed if not getattr(perms, attr)]
+    if missing:
+        return await reply_and_clean(
+            ctx,
+            "Il me manque dans ce salon : " + ", ".join(f"`{m}`" for m in missing),
+            delay=8,
+        )
+
+    config = get_settings(ctx.guild.id)
+    channels = config.copy_channels.setdefault(str(ctx.author.id), [])
+    if ctx.channel.id in channels:
+        return await reply_and_clean(ctx, "La copie est déjà active dans ce salon.")
+    channels.append(ctx.channel.id)
+    save_settings()
+    await reply_and_clean(
+        ctx,
+        f"Copie activée ici : je renvoie ce que tu envoies et je supprime l'original. "
+        f"`{PREFIX}unco` pour arrêter.",
+    )
+
+
+@bot.command(name="coo")
+@commands.guild_only()
+@commands.has_permissions(manage_messages=True)
+async def copy_everywhere(ctx: commands.Context):
+    """Active la copie dans tous les salons du serveur."""
+    config = get_settings(ctx.guild.id)
+    if ctx.author.id in config.copy_all_users:
+        return await reply_and_clean(ctx, "La copie est déjà active dans tous les salons.")
+    config.copy_all_users.append(ctx.author.id)
+    save_settings()
+    await reply_and_clean(
+        ctx,
+        f"Copie activée dans tous les salons où je peux écrire. `{PREFIX}uncoo` pour arrêter.",
+    )
+
+
+@bot.command(name="unco")
+@commands.guild_only()
+@commands.has_permissions(manage_messages=True)
+async def uncopy_here(ctx: commands.Context):
+    """Désactive la copie dans ce salon."""
+    config = get_settings(ctx.guild.id)
+    key = str(ctx.author.id)
+    channels = config.copy_channels.get(key, [])
+    if ctx.channel.id in channels:
+        channels.remove(ctx.channel.id)
+        if not channels:
+            config.copy_channels.pop(key, None)
+        save_settings()
+        return await reply_and_clean(ctx, "Copie désactivée dans ce salon.")
+    if ctx.author.id in config.copy_all_users:
+        return await reply_and_clean(
+            ctx, f"Ce salon est couvert par `{PREFIX}coo` : utilise `{PREFIX}uncoo` pour tout arrêter.",
+            delay=8,
+        )
+    await reply_and_clean(ctx, "La copie n'est pas active dans ce salon.")
+
+
+@bot.command(name="uncoo")
+@commands.guild_only()
+@commands.has_permissions(manage_messages=True)
+async def uncopy_everywhere(ctx: commands.Context):
+    """Désactive la copie partout (tous les salons, y compris ceux de !co)."""
+    config = get_settings(ctx.guild.id)
+    was_active = (
+        ctx.author.id in config.copy_all_users or str(ctx.author.id) in config.copy_channels
+    )
+    if ctx.author.id in config.copy_all_users:
+        config.copy_all_users.remove(ctx.author.id)
+    config.copy_channels.pop(str(ctx.author.id), None)
+    save_settings()
+    await reply_and_clean(
+        ctx, "Copie désactivée partout." if was_active else "La copie n'était pas active."
+    )
+
+
 @bot.command(name="aide")
 async def aide(ctx: commands.Context):
     await ctx.send(
         f"`{PREFIX}panel` / `{PREFIX}pannel` | "
-        f"`{PREFIX}parler <texte>` | `{PREFIX}on` / `{PREFIX}off` | `{PREFIX}ping` / `{PREFIX}unping` / `{PREFIX}pings` | `{PREFIX}aide` | "
+        f"`{PREFIX}parler <texte>` | `{PREFIX}on` / `{PREFIX}off` | `{PREFIX}ping` / `{PREFIX}unping` / `{PREFIX}pings` | `{PREFIX}co` / `{PREFIX}unco` (copie ce salon) | `{PREFIX}coo` / `{PREFIX}uncoo` (copie partout) | `{PREFIX}aide` | "
         "`/massrole` | `/autorole definir|desactiver|statut`", delete_after=15
     )
 
